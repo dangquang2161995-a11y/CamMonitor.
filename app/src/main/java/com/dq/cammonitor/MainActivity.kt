@@ -59,6 +59,9 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.sqrt
+import javax.microedition.khronos.egl.EGL10
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.egl.EGLDisplay
 
 class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, SensorEventListener {
 
@@ -74,6 +77,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     private lateinit var camInfoText: TextView
     private lateinit var bars: LinearLayout
     private lateinit var cameraBar: HorizontalScrollView
+    private lateinit var toolBar: HorizontalScrollView
+    private lateinit var sideButtons: LinearLayout
+    private lateinit var cameraToggle: Button
+    private var showTools = true
+    private var showCamera = true
 
     /** Mỗi nút đăng ký một hàm cập nhật nhãn, để làm mới đồng loạt khi nạp preset. */
     private val labelUpdaters = ArrayList<() -> Unit>()
@@ -99,6 +107,17 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     private var ptpH = 0
     private var lastInfo: SonyInfo? = null
 
+    // Giải mã JPEG ở luồng riêng để luồng USB lấy khung kế tiếp song song
+    private val frameLock = Object()
+    private var slot = ByteArray(0)
+    private var slotLen = 0
+    private var slotFull = false
+    private var work = ByteArray(0)
+    @Volatile private var decoding = false
+    private var decodeThread: Thread? = null
+    @Volatile private var fpsReceived = 0
+    @Volatile private var fpsShown = 0
+
     /** Surface đang được dùng bởi: 0 = chưa ai, 1 = UVC, 2 = PC Remote */
     private var surfaceUse = 0
     private var surfaceRecreating = false
@@ -121,6 +140,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         override fun run() {
             checkSonyRemote()
             refreshDiag()
+            updateFpsInfo()
             handler.postDelayed(this, 1000)
         }
     }
@@ -162,6 +182,27 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         renderer = MonitorRenderer(state, this)
         glView = GLSurfaceView(this)
         glView.setEGLContextClientVersion(2)
+        // Chọn cấu hình EGL cho phép ghi hình (cần để ghi preview bằng bộ mã hoá video);
+        // nếu máy không có thì dùng cấu hình thường.
+        glView.setEGLConfigChooser(object : GLSurfaceView.EGLConfigChooser {
+            override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
+                val base = intArrayOf(
+                    EGL10.EGL_RED_SIZE, 8, EGL10.EGL_GREEN_SIZE, 8, EGL10.EGL_BLUE_SIZE, 8,
+                    EGL10.EGL_ALPHA_SIZE, 8, EGL10.EGL_RENDERABLE_TYPE, 4
+                )
+                val recordable = base + intArrayOf(EGL_RECORDABLE_ANDROID, 1, EGL10.EGL_NONE)
+                val plain = base + intArrayOf(EGL10.EGL_NONE)
+                for (attrs in arrayOf(recordable, plain)) {
+                    val configs = arrayOfNulls<EGLConfig>(1)
+                    val count = IntArray(1)
+                    if (egl.eglChooseConfig(display, attrs, configs, 1, count) && count[0] > 0) {
+                        val c = configs[0]
+                        if (c != null) return c
+                    }
+                }
+                throw IllegalStateException("Không tìm được cấu hình hiển thị phù hợp")
+            }
+        })
         glView.preserveEGLContextOnPause = true
         glView.setRenderer(renderer)
         glView.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
@@ -221,7 +262,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         cameraBar.visibility = View.GONE
         bars.addView(cameraBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val toolBar = HorizontalScrollView(this)
+        toolBar = HorizontalScrollView(this)
         toolBar.isHorizontalScrollBarEnabled = false
         toolBar.setBackgroundColor(Color.argb(150, 0, 0, 0))
         toolBar.addView(buildToolRow())
@@ -234,8 +275,26 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         )
         root.addView(bars, barsLp)
 
+        // Hai nút nhỏ luôn hiện ở mép trái để ẩn/hiện từng thanh, không che hình
+        sideButtons = LinearLayout(this)
+        sideButtons.orientation = LinearLayout.VERTICAL
+        val toolsToggle = sideButton("Công cụ") {
+            showTools = !showTools
+            updateBars()
+        }
+        cameraToggle = sideButton("Máy ảnh") {
+            showCamera = !showCamera
+            updateBars()
+        }
+        sideButtons.addView(toolsToggle)
+        sideButtons.addView(cameraToggle)
+        val sideLp = wrap(Gravity.START or Gravity.CENTER_VERTICAL)
+        sideLp.leftMargin = dp(4)
+        root.addView(sideButtons, sideLp)
+
         overlay.setOnTouchListener { _, event -> handleTouch(event) }
         setContentView(root)
+        updateBars()
     }
 
     private fun buildToolRow(): LinearLayout {
@@ -457,16 +516,44 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         window.attributes = lp
     }
 
+    private fun sideButton(label: String, action: () -> Unit): Button {
+        val b = Button(this)
+        b.setAllCaps(false)
+        b.textSize = 10f
+        b.text = label
+        b.alpha = 0.75f
+        b.minWidth = 0
+        b.minimumWidth = 0
+        b.minHeight = 0
+        b.minimumHeight = 0
+        b.setPadding(dp(8), 0, dp(8), 0)
+        b.setOnClickListener { action() }
+        b.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34))
+        return b
+    }
+
+    /** Chạm vào hình: ẩn hoặc hiện cả hai thanh cùng lúc. */
     private fun setBarsVisible(visible: Boolean) {
-        barsVisible = visible
-        bars.visibility = if (visible) View.VISIBLE else View.GONE
+        showTools = visible
+        showCamera = visible
+        updateBars()
+    }
+
+    /** Áp trạng thái ẩn/hiện của từng thanh; thanh máy ảnh chỉ có khi nối PC Remote. */
+    private fun updateBars() {
+        toolBar.visibility = if (showTools && !locked) View.VISIBLE else View.GONE
+        cameraBar.visibility = if (showCamera && ptpStreaming && !locked) View.VISIBLE else View.GONE
+        cameraToggle.visibility = if (ptpStreaming) View.VISIBLE else View.GONE
+        sideButtons.visibility = if (locked) View.GONE else View.VISIBLE
+        barsVisible = showTools || (showCamera && ptpStreaming)
+        prefs.edit().putBoolean("showTools", showTools).putBoolean("showCamera", showCamera).apply()
         hideSystemBars()
     }
 
     private fun setLocked(lock: Boolean) {
         locked = lock
         overlay.locked = lock
-        setBarsVisible(!lock)
+        updateBars()
         overlay.invalidate()
     }
 
@@ -902,7 +989,10 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             previewRecording = false
             overlay.previewRecording = false
             afterChange()
-            if (error != null) toast("Ghi preview dừng: $error")
+            if (error != null) {
+                toast("Ghi preview dừng: $error")
+                logEvent("Ghi preview lỗi: $error")
+            }
         }
         if (file == null) return
         // Chép file vào thư viện ở luồng phụ để không làm khựng hình
@@ -1208,21 +1298,89 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         logEvent("Sony PC Remote: bắt đầu kết nối")
         val remote = SonyRemote(usb, dev, this)
         sonyRemote = remote
+        startDecoder()
         remote.start()
     }
 
     private fun stopSonyRemote() {
         val remote = sonyRemote ?: return
         ptpSurface = null
+        stopDecoder()
         remote.stop()
+    }
+
+    private fun startDecoder() {
+        if (decodeThread != null) return
+        decoding = true
+        val t = Thread({ decodeLoop() }, "JpegDecoder")
+        decodeThread = t
+        t.start()
+    }
+
+    private fun stopDecoder() {
+        decoding = false
+        synchronized(frameLock) {
+            slotFull = false
+            frameLock.notifyAll()
+        }
+        decodeThread = null
+    }
+
+    private fun decodeLoop() {
+        while (decoding) {
+            var len = 0
+            synchronized(frameLock) {
+                while (!slotFull && decoding) {
+                    try {
+                        frameLock.wait(500)
+                    } catch (e: InterruptedException) {
+                        // bỏ qua
+                    }
+                }
+                if (slotFull) {
+                    // Đổi chỗ hai bộ đệm: luồng USB ghi tiếp vào cái còn lại
+                    val tmp = work
+                    work = slot
+                    slot = tmp
+                    len = slotLen
+                    slotFull = false
+                }
+            }
+            if (len > 0 && decoding) decodeAndDraw(work, len)
+        }
+    }
+
+    /** Mỗi giây cập nhật dòng thông tin: số khung máy ảnh gửi và số khung hiện được. */
+    private fun updateFpsInfo() {
+        if (!ptpStreaming) return
+        val received = fpsReceived
+        val shown = fpsShown
+        fpsReceived = 0
+        fpsShown = 0
+        infoText.text = videoW.toString() + "×" + videoH.toString() +
+            " · PC Remote · nhận " + received + " / hiện " + shown + " fps"
     }
 
     override fun onRemoteLog(msg: String) {
         runOnUiThread { logEvent(msg) }
     }
 
-    /** Chạy trên luồng của SonyRemote: giải mã JPEG rồi vẽ vào surface của OpenGL. */
+    /** Chạy trên luồng của SonyRemote: chép khung hình cho luồng giải mã rồi quay lại lấy khung kế. */
     override fun onRemoteFrame(data: ByteArray, offset: Int, length: Int) {
+        fpsReceived++
+        synchronized(frameLock) {
+            if (slot.size < length) slot = ByteArray(length + 64 * 1024)
+            System.arraycopy(data, offset, slot, 0, length)
+            slotLen = length
+            // Nếu khung trước chưa kịp giải mã thì bị ghi đè: luôn hiện khung mới nhất
+            slotFull = true
+            frameLock.notifyAll()
+        }
+    }
+
+    /** Chạy trên luồng giải mã: giải mã JPEG rồi vẽ vào surface của OpenGL. */
+    private fun decodeAndDraw(data: ByteArray, length: Int) {
+        val offset = 0
         val s = ptpSurface ?: return
         ptpOptions.inMutable = true
         ptpOptions.inBitmap = ptpBitmap
@@ -1252,6 +1410,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             ptpDst.set(0, 0, canvas.width, canvas.height)
             canvas.drawBitmap(frame, null, ptpDst, null)
             s.unlockCanvasAndPost(canvas)
+            fpsShown++
         } catch (e: Exception) {
             // surface vừa bị thay, bỏ khung hình này
         }
@@ -1266,8 +1425,10 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         glView.queueEvent { renderer.applyVideoSize(w, h) }
         ptpStreaming = true
         statusText.visibility = View.GONE
-        cameraBar.visibility = View.VISIBLE
+        updateBars()
         infoText.text = w.toString() + "×" + h.toString() + " · PC Remote"
+        fpsReceived = 0
+        fpsShown = 0
         logEvent("PC Remote: có hình " + w + "x" + h)
     }
 
@@ -1287,10 +1448,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             sonyRemote = null
             ptpSurface = null
             ptpStreaming = false
+            stopDecoder()
             lastInfo = null
             overlay.cameraRecording = false
             camInfoText.visibility = View.GONE
-            cameraBar.visibility = View.GONE
+            updateBars()
             ptpRetryAt = SystemClock.elapsedRealtime() + 3000
             if (error != null) logEvent("PC Remote dừng: $error")
             if (!cameraOpened) {
@@ -1390,6 +1552,8 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             state.maxBright = true
         }
         currentLut = prefs.getString("lutFile", "") ?: ""
+        showTools = prefs.getBoolean("showTools", true)
+        showCamera = prefs.getBoolean("showCamera", true)
     }
 
     private fun saveState() {
@@ -1403,6 +1567,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         private const val REQ_CAMERA = 1
         private const val REQ_LUT = 2
         private const val REQ_ONION = 3
+        private const val EGL_RECORDABLE_ANDROID = 0x3142
         private const val ACTION_USB_PERMISSION = "com.dq.cammonitor.USB_PERMISSION"
         private const val TEXT_WAITING =
             "Chưa thấy máy ảnh.\nSony: đặt MENU > Network > PC Remote Function > PC Remote = On (kết nối USB), rồi cắm dây USB-C.\nCapture card HDMI: cắm vào là tự nhận. Chạm vào đây để thử kết nối lại."

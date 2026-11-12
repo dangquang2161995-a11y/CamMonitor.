@@ -6,6 +6,7 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.os.Build
 import android.os.SystemClock
 import java.io.IOException
 import java.util.Locale
@@ -100,7 +101,9 @@ class SonyRemote(
     private var tid = 0
 
     private val tx = ByteArray(64)
-    private val rx = ByteArray(16384)
+    // Android 9 trở lên cho đọc khối lớn trong một lần gọi: cả khung hình về trong 1-2 lượt
+    // thay vì hàng chục lượt 16 KB, giảm đáng kể thời gian lấy mỗi khung hình.
+    private val rx = ByteArray(if (Build.VERSION.SDK_INT >= 28) 1024 * 1024 else 16384)
     private val valueBytes = ByteArray(8)
     private var data = ByteArray(512 * 1024)
     private var dataLen = 0
@@ -250,7 +253,7 @@ class SonyRemote(
                     control(OC_SONY_CONTROL_B, PROP_SHUTTER_HALF, 2, 1)
                 }
                 if (now >= nextInfoAt) {
-                    nextInfoAt = now + 600
+                    nextInfoAt = now + 1000
                     pollInfo()
                 }
 
@@ -277,7 +280,7 @@ class SonyRemote(
                         warned = true
                         listener.onRemoteLog("Máy ảnh chưa trả hình (mã 0x" + Integer.toHexString(rc) + ")")
                     }
-                    sleepQuietly(20)
+                    sleepQuietly(6)
                 }
             }
         } catch (e: Exception) {
@@ -566,7 +569,7 @@ class SonyRemote(
             if (got > payload) got = payload
             System.arraycopy(rx, 12, data, 0, got)
             while (got < payload) {
-                val want = minOf(payload - got, 16384)
+                val want = minOf(payload - got, rx.size)
                 val m = c.bulkTransfer(epI, data, got, want, 3000)
                 if (m < 0) throw IOException("Đứt kết nối khi nhận hình")
                 got += m

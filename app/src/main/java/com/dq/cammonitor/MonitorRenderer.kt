@@ -130,7 +130,12 @@ class MonitorRenderer(
         try {
             val w = videoW and 1.inv()
             val h = videoH and 1.inv()
-            recorder = PreviewRecorder(w, h, file, orientationHint)
+            recorder = try {
+                PreviewRecorder(w, h, file, orientationHint)
+            } catch (first: Exception) {
+                // Một số bộ mã hoá chỉ nhận kích thước chia hết cho 16
+                PreviewRecorder(w and 15.inv(), h and 15.inv(), file, orientationHint)
+            }
             listener.onRecordingStarted()
         } catch (e: Exception) {
             recorder = null
