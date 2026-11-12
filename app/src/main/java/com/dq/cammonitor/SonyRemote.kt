@@ -101,9 +101,9 @@ class SonyRemote(
     private var tid = 0
 
     private val tx = ByteArray(64)
-    // Android 9 trở lên cho đọc khối lớn trong một lần gọi: cả khung hình về trong 1-2 lượt
-    // thay vì hàng chục lượt 16 KB, giảm đáng kể thời gian lấy mỗi khung hình.
-    private val rx = ByteArray(if (Build.VERSION.SDK_INT >= 28) 1024 * 1024 else 16384)
+    // Bộ đệm đọc USB. Cỡ đọc mỗi lượt (readChunk) bắt đầu ở 64 KB trên Android 9+ để
+    // lấy khung hình nhanh hơn, và tự lùi về 16 KB nếu điện thoại không chịu khối lớn.
+    private val rx = ByteArray(65536)
     private val valueBytes = ByteArray(8)
     private var data = ByteArray(512 * 1024)
     private var dataLen = 0
@@ -225,7 +225,16 @@ class SonyRemote(
 
             // 1. Mở phiên PTP
             tid = 0
-            val open = transact(OC_OPEN_SESSION, 1)
+            var open: Int
+            try {
+                open = transact(OC_OPEN_SESSION, 1)
+            } catch (e: IOException) {
+                // Phiên trước kết thúc dở dang làm cổng USB của máy ảnh bị kẹt: đặt lại rồi thử lần nữa
+                listener.onRemoteLog("Kết nối bị kẹt (" + (e.message ?: "") + "), đang đặt lại")
+                recover(c, intf)
+                tid = 0
+                open = transact(OC_OPEN_SESSION, 1)
+            }
             if (open != RC_OK && open != RC_SESSION_ALREADY_OPEN) {
                 throw IOException("OpenSession bị từ chối, mã 0x" + Integer.toHexString(open))
             }
@@ -307,6 +316,28 @@ class SonyRemote(
             pending.clear()
             listener.onRemoteStopped(error)
         }
+    }
+
+    /**
+     * Gỡ trạng thái kẹt sau một phiên lỗi: yêu cầu máy ảnh đặt lại giao thức PTP,
+     * xoá cờ dừng của hai cổng dữ liệu và đọc bỏ dữ liệu còn sót.
+     */
+    private fun recover(c: UsbDeviceConnection, intf: UsbInterface) {
+        val inEp = epIn
+        val outEp = epOut
+        // Yêu cầu chuẩn của lớp Still Image: Device Reset (0x66)
+        c.controlTransfer(0x21, 0x66, 0, intf.id, null, 0, 800)
+        if (inEp != null) c.controlTransfer(0x02, 0x01, 0, inEp.address, null, 0, 500)
+        if (outEp != null) c.controlTransfer(0x02, 0x01, 0, outEp.address, null, 0, 500)
+        if (inEp != null) {
+            var rounds = 0
+            while (rounds < 6) {
+                val n = c.bulkTransfer(inEp, rx, SAFE_CHUNK, 80)
+                if (n <= 0) break
+                rounds++
+            }
+        }
+        sleepQuietly(200)
     }
 
     private fun expectOk(step: String, rc: Int) {
@@ -530,7 +561,10 @@ class SonyRemote(
         putLe16(tx, 6, code)
         putLe32(tx, 8, id)
         for (i in params.indices) putLe32(tx, 12 + 4 * i, params[i])
-        if (c.bulkTransfer(epO, tx, len, 2000) != len) throw IOException("Gửi lệnh USB thất bại")
+        val sent = c.bulkTransfer(epO, tx, len, 2000)
+        if (sent != len) {
+            throw IOException("Gửi lệnh 0x" + Integer.toHexString(code) + " thất bại (USB trả " + sent + ")")
+        }
 
         if (out != null) {
             val total = 12 + outLen
@@ -546,8 +580,13 @@ class SonyRemote(
         var emptyReads = 0
         var response = -1
         while (response < 0) {
-            val n = c.bulkTransfer(epI, rx, rx.size, 3000)
-            if (n < 0) throw IOException("Máy ảnh không phản hồi")
+            var n = c.bulkTransfer(epI, rx, readChunk, 3000)
+            if (n < 0 && readChunk > SAFE_CHUNK) {
+                // Điện thoại từ chối khối đọc lớn: lùi về cỡ an toàn và đọc lại
+                readChunk = SAFE_CHUNK
+                n = c.bulkTransfer(epI, rx, SAFE_CHUNK, 3000)
+            }
+            if (n < 0) throw IOException("Máy ảnh không phản hồi (lệnh 0x" + Integer.toHexString(code) + ")")
             if (n == 0) {
                 emptyReads++
                 if (emptyReads > 5) throw IOException("Máy ảnh không phản hồi")
@@ -569,8 +608,12 @@ class SonyRemote(
             if (got > payload) got = payload
             System.arraycopy(rx, 12, data, 0, got)
             while (got < payload) {
-                val want = minOf(payload - got, rx.size)
-                val m = c.bulkTransfer(epI, data, got, want, 3000)
+                val want = minOf(payload - got, readChunk)
+                var m = c.bulkTransfer(epI, data, got, want, 3000)
+                if (m < 0 && readChunk > SAFE_CHUNK) {
+                    readChunk = SAFE_CHUNK
+                    m = c.bulkTransfer(epI, data, got, minOf(payload - got, SAFE_CHUNK), 3000)
+                }
                 if (m < 0) throw IOException("Đứt kết nối khi nhận hình")
                 got += m
             }
@@ -590,6 +633,11 @@ class SonyRemote(
 
     companion object {
         const val SONY_VENDOR_ID = 0x054C
+
+        private const val SAFE_CHUNK = 16384
+
+        /** Cỡ đọc USB mỗi lượt; giữ qua các lần kết nối lại để không thử lại khối lớn đã thất bại. */
+        @Volatile private var readChunk = if (Build.VERSION.SDK_INT >= 28) 65536 else SAFE_CHUNK
 
         // Mã thuộc tính
         const val PROP_WHITE_BALANCE = 0x5005
