@@ -6,6 +6,7 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.os.SystemClock
 import android.util.Log
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -14,21 +15,26 @@ import javax.microedition.khronos.opengles.GL10
 
 /**
  * Vẽ hình từ máy ảnh lên màn hình bằng OpenGL ES 2.0.
- * Toàn bộ peaking / zebra / false color chạy trong fragment shader (GPU).
+ * Peaking / zebra / false color / LUT / xem kênh màu chạy trong fragment shader (GPU).
  */
 class MonitorRenderer(
     private val state: MonitorState,
     private val listener: Listener
 ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
 
+    /** Mọi hàm (trừ onFrameAvailable) được gọi trên luồng GL. */
     interface Listener {
-        /** Gọi trên luồng GL khi SurfaceTexture mới đã sẵn sàng nhận hình. */
         fun onSurfaceTextureReady(surfaceTexture: SurfaceTexture)
-
-        /** Gọi trên luồng GL, bins gồm 4 đoạn HIST_BINS: sáng, đỏ, lục, lam. */
-        fun onHistogram(bins: IntArray)
-
         fun onFrameAvailable()
+
+        /** Ảnh thu nhỏ RGBA (hàng 0 là đáy hình) để tính histogram, waveform, vectorscope. */
+        fun onAnalysis(pixels: ByteArray, width: Int, height: Int)
+
+        /** Khung hình sạch độ phân giải gốc (RGBA, hàng 0 là đáy hình). */
+        fun onCapture(pixels: ByteBuffer, width: Int, height: Int, purpose: Int)
+
+        fun onRecordingStarted()
+        fun onRecordingStopped(file: File?, error: String?)
     }
 
     private var program = 0
@@ -36,6 +42,7 @@ class MonitorRenderer(
     private var uScale = 0
     private var uUvScale = 0
     private var uUvOffset = 0
+    private var uRot = 0
     private var uTexMatrix = 0
     private var uTexel = 0
     private var uMode = 0
@@ -58,11 +65,18 @@ class MonitorRenderer(
     private var oesTex = 0
     private var surfaceTexture: SurfaceTexture? = null
     private val texMatrix = FloatArray(16)
+    private val rotMatrix = FloatArray(4)
 
     private var fbo = 0
     private var fboTex = 0
-    private val histPixels: ByteBuffer =
-        ByteBuffer.allocateDirect(HIST_W * HIST_H * 4).order(ByteOrder.nativeOrder())
+    private val analysisPixels: ByteBuffer =
+        ByteBuffer.allocateDirect(ANALYSIS_W * ANALYSIS_H * 4).order(ByteOrder.nativeOrder())
+    private val analysisA = ByteArray(ANALYSIS_W * ANALYSIS_H * 4)
+    private val analysisB = ByteArray(ANALYSIS_W * ANALYSIS_H * 4)
+    private var analysisFlip = false
+
+    @Volatile private var captureRequest = 0
+    private var recorder: PreviewRecorder? = null
 
     private var viewW = 1
     private var viewH = 1
@@ -105,6 +119,38 @@ class MonitorRenderer(
         lutDirty = true
     }
 
+    /** Gọi từ luồng bất kỳ: lấy một khung hình sạch ở lần vẽ tới. */
+    fun requestCapture(purpose: Int) {
+        captureRequest = purpose
+    }
+
+    /** Gọi trên luồng GL. */
+    fun startRecording(file: File, orientationHint: Int) {
+        if (recorder != null) return
+        try {
+            val w = videoW and 1.inv()
+            val h = videoH and 1.inv()
+            recorder = PreviewRecorder(w, h, file, orientationHint)
+            listener.onRecordingStarted()
+        } catch (e: Exception) {
+            recorder = null
+            listener.onRecordingStopped(null, e.message ?: "Không khởi tạo được bộ ghi hình")
+        }
+    }
+
+    /** Gọi trên luồng GL. */
+    fun stopRecording() {
+        val r = recorder ?: return
+        recorder = null
+        val ok = r.finish()
+        if (ok) {
+            listener.onRecordingStopped(r.file, null)
+        } else {
+            r.file.delete()
+            listener.onRecordingStopped(null, "Chưa ghi được khung hình nào")
+        }
+    }
+
     private fun uploadLut() {
         lutDirty = false
         val data = lutData ?: return
@@ -128,14 +174,17 @@ class MonitorRenderer(
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        // Ngữ cảnh GL mới: texture LUT cũ không còn, phải nạp lại
+        // Ngữ cảnh GL mới: texture LUT cũ không còn, phải nạp lại; bản ghi dở cũng hỏng
         lutTex = 0
         lutDirty = lutData != null
+        recorder = null
+
         program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         aPos = GLES20.glGetAttribLocation(program, "aPos")
         uScale = GLES20.glGetUniformLocation(program, "uScale")
         uUvScale = GLES20.glGetUniformLocation(program, "uUvScale")
         uUvOffset = GLES20.glGetUniformLocation(program, "uUvOffset")
+        uRot = GLES20.glGetUniformLocation(program, "uRot")
         uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix")
         uTexel = GLES20.glGetUniformLocation(program, "uTexel")
         uMode = GLES20.glGetUniformLocation(program, "uMode")
@@ -166,12 +215,12 @@ class MonitorRenderer(
         st.setOnFrameAvailableListener(this)
         surfaceTexture = st
 
-        // Framebuffer nhỏ để lấy mẫu tính histogram
+        // Framebuffer nhỏ để lấy mẫu cho các biểu đồ
         GLES20.glGenTextures(1, t, 0)
         fboTex = t[0]
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTex)
         GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, HIST_W, HIST_H, 0,
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, ANALYSIS_W, ANALYSIS_H, 0,
             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
         )
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
@@ -211,8 +260,34 @@ class MonitorRenderer(
         frameCount++
         if (lutDirty) uploadLut()
 
-        if (state.histogram != 0 && frameCount % HIST_EVERY == 0) {
-            computeHistogram()
+        val scopesOn = state.histogram != 0 || state.waveform || state.vectorscope
+        if (scopesOn && frameCount % ANALYSIS_EVERY == 0) {
+            runAnalysis()
+        }
+
+        val purpose = captureRequest
+        if (purpose != 0) {
+            captureRequest = 0
+            runCapture(purpose)
+        }
+
+        val rec = recorder
+        if (rec != null) {
+            try {
+                rec.begin()
+                GLES20.glViewport(0, 0, rec.width, rec.height)
+                draw(1f, 1f, 1f, 1f, 0f, 0f, 0, false)
+                rec.end(System.nanoTime())
+            } catch (e: Exception) {
+                recorder = null
+                try {
+                    rec.finish()
+                } catch (e2: Exception) {
+                    // bỏ qua, file sẽ bị xoá
+                }
+                rec.file.delete()
+                listener.onRecordingStopped(null, e.message ?: "Lỗi khi ghi hình")
+            }
         }
 
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -220,19 +295,19 @@ class MonitorRenderer(
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        val aspect = videoW.toFloat() * state.squeezeFactor / videoH.toFloat()
-        val fit = MonitorState.fit(viewW, viewH, aspect)
+        val fit = MonitorState.fit(viewW, viewH, state.displayAspect(videoW, videoH))
         val zoom = state.zoomFactor
         val flip = state.flip
         val sx = (if (flip and 1 != 0) -1f else 1f) / zoom
         val sy = (if (flip and 2 != 0) -1f else 1f) / zoom
-        draw(fit[0], fit[1], sx, sy, state.panX, state.panY, true)
+        draw(fit[0], fit[1], sx, sy, state.panX, state.panY, state.rotation, true)
     }
 
     private fun draw(
         scaleX: Float, scaleY: Float,
         uvScaleX: Float, uvScaleY: Float,
         offX: Float, offY: Float,
+        rotation: Int,
         effects: Boolean
     ) {
         GLES20.glUseProgram(program)
@@ -253,8 +328,19 @@ class MonitorRenderer(
         GLES20.glUniform2f(uScale, scaleX, scaleY)
         GLES20.glUniform2f(uUvScale, uvScaleX, uvScaleY)
         GLES20.glUniform2f(uUvOffset, offX, offY)
+
+        // Ma trận xoay 2x2 (theo cột) cho bội số của 90 độ
+        val c = ROT_COS[rotation and 3]
+        val s = ROT_SIN[rotation and 3]
+        rotMatrix[0] = c
+        rotMatrix[1] = s
+        rotMatrix[2] = -s
+        rotMatrix[3] = c
+        GLES20.glUniformMatrix2fv(uRot, 1, false, rotMatrix, 0)
+
         GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
-        GLES20.glUniform2f(uTexel, 1f / videoW, 1f / videoH)
+        val width = PEAK_WIDTHS[state.peakWidth.coerceIn(0, 2)]
+        GLES20.glUniform2f(uTexel, width / videoW, width / videoH)
 
         val peaking = if (effects) state.peaking else 0
         val zebra = if (effects) state.zebra else 0
@@ -263,6 +349,8 @@ class MonitorRenderer(
         when (peaking) {
             2 -> GLES20.glUniform3f(uPeakColor, 0.1f, 1f, 0.2f)
             3 -> GLES20.glUniform3f(uPeakColor, 1f, 0.95f, 0f)
+            4 -> GLES20.glUniform3f(uPeakColor, 1f, 1f, 1f)
+            5 -> GLES20.glUniform3f(uPeakColor, 0.15f, 0.45f, 1f)
             else -> GLES20.glUniform3f(uPeakColor, 1f, 0.1f, 0.1f)
         }
         GLES20.glUniform1f(uPeakThresh, PEAK_THRESH[state.peakSens.coerceIn(0, 2)])
@@ -278,33 +366,62 @@ class MonitorRenderer(
         GLES20.glDisableVertexAttribArray(aPos)
     }
 
-    /** Vẽ ảnh gốc (không hiệu ứng) vào khung nhỏ rồi đọc về để đếm độ sáng. */
-    private fun computeHistogram() {
+    /** Vẽ ảnh (không hiệu ứng, đã xoay như đang hiển thị) vào khung nhỏ rồi đọc về. */
+    private fun runAnalysis() {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
-        GLES20.glViewport(0, 0, HIST_W, HIST_H)
-        draw(1f, 1f, 1f, 1f, 0f, 0f, false)
-        histPixels.position(0)
+        GLES20.glViewport(0, 0, ANALYSIS_W, ANALYSIS_H)
+        draw(1f, 1f, 1f, 1f, 0f, 0f, state.rotation, false)
+        analysisPixels.position(0)
         GLES20.glReadPixels(
-            0, 0, HIST_W, HIST_H, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, histPixels
+            0, 0, ANALYSIS_W, ANALYSIS_H, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, analysisPixels
         )
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
-        val bins = IntArray(HIST_BINS * 4)
-        val total = HIST_W * HIST_H
-        var i = 0
-        for (p in 0 until total) {
-            val r = histPixels.get(i).toInt() and 0xFF
-            val g = histPixels.get(i + 1).toInt() and 0xFF
-            val b = histPixels.get(i + 2).toInt() and 0xFF
-            i += 4
-            // Rec.709 luma, hệ số nguyên (tổng 256)
-            val y = (54 * r + 183 * g + 19 * b) shr 8
-            bins[(y * HIST_BINS) shr 8]++
-            bins[HIST_BINS + ((r * HIST_BINS) shr 8)]++
-            bins[HIST_BINS * 2 + ((g * HIST_BINS) shr 8)]++
-            bins[HIST_BINS * 3 + ((b * HIST_BINS) shr 8)]++
+        // Luân phiên hai mảng để luồng giao diện không đọc trúng mảng đang ghi
+        analysisFlip = !analysisFlip
+        val out = if (analysisFlip) analysisA else analysisB
+        analysisPixels.position(0)
+        analysisPixels.get(out)
+        listener.onAnalysis(out, ANALYSIS_W, ANALYSIS_H)
+    }
+
+    /** Vẽ một khung hình sạch (chỉ áp LUT) ở độ phân giải gốc rồi đọc về. */
+    private fun runCapture(purpose: Int) {
+        val w = videoW.coerceIn(16, 4096)
+        val h = videoH.coerceIn(16, 4096)
+        val tex = IntArray(1)
+        val fb = IntArray(1)
+        GLES20.glGenTextures(1, tex, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+        )
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glGenFramebuffers(1, fb, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fb[0])
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, tex[0], 0
+        )
+        var pixels: ByteBuffer? = null
+        if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+            GLES20.glViewport(0, 0, w, h)
+            draw(1f, 1f, 1f, 1f, 0f, 0f, 0, false)
+            try {
+                val buf = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+                GLES20.glReadPixels(0, 0, w, h, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buf)
+                buf.position(0)
+                pixels = buf
+            } catch (e: OutOfMemoryError) {
+                pixels = null
+            }
         }
-        listener.onHistogram(bins)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glDeleteFramebuffers(1, fb, 0)
+        GLES20.glDeleteTextures(1, tex, 0)
+        val result = pixels
+        if (result != null) listener.onCapture(result, w, h, purpose)
     }
 
     private fun buildProgram(vs: String, fs: String): Int {
@@ -337,13 +454,21 @@ class MonitorRenderer(
     companion object {
         private const val TAG = "MonitorRenderer"
 
-        const val HIST_BINS = 64
-        private const val HIST_W = 128
-        private const val HIST_H = 72
-        private const val HIST_EVERY = 5
+        const val ANALYSIS_W = 128
+        const val ANALYSIS_H = 72
+        private const val ANALYSIS_EVERY = 4
+
+        const val CAPTURE_SAVE = 1
+        const val CAPTURE_ONION = 2
+
+        private val ROT_COS = floatArrayOf(1f, 0f, -1f, 0f)
+        private val ROT_SIN = floatArrayOf(0f, 1f, 0f, -1f)
 
         /** Ngưỡng cạnh cho peaking: thấp / vừa / cao (số nhỏ = nhạy hơn) */
         private val PEAK_THRESH = floatArrayOf(0.22f, 0.13f, 0.07f)
+
+        /** Khoảng lấy mẫu cạnh (điểm ảnh): mảnh / vừa / dày */
+        private val PEAK_WIDTHS = floatArrayOf(1f, 2f, 3f)
 
         /** Mức zebra: tắt / 70% / 95% / 100% */
         private val ZEBRA_LEVELS = floatArrayOf(2f, 0.70f, 0.95f, 0.995f)
@@ -353,10 +478,12 @@ attribute vec2 aPos;
 uniform vec2 uScale;
 uniform vec2 uUvScale;
 uniform vec2 uUvOffset;
+uniform mat2 uRot;
 varying vec2 vUv;
 void main() {
     gl_Position = vec4(aPos * uScale, 0.0, 1.0);
-    vUv = (aPos * 0.5) * uUvScale + 0.5 + uUvOffset;
+    vec2 q = (aPos * 0.5) * uUvScale + uUvOffset;
+    vUv = uRot * q + 0.5;
 }
 """
 
@@ -421,14 +548,21 @@ void main() {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
-    vec3 c = samp(vUv);
+    vec3 raw = samp(vUv);
+    vec3 c = raw;
     if (uLutOn > 0.5) {
         c = applyLut(c);
     }
     float y = luma(c);
     vec3 o = c;
 
-    if (uMode > 1.5) {
+    if (uMode > 4.5) {
+        o = vec3(c.b);
+    } else if (uMode > 3.5) {
+        o = vec3(c.g);
+    } else if (uMode > 2.5) {
+        o = vec3(c.r);
+    } else if (uMode > 1.5) {
         o = vec3(y);
     } else if (uMode > 0.5) {
         o = falseColor(y);
@@ -454,7 +588,8 @@ void main() {
         float r = luma(samp(vUv + vec2(uTexel.x, 0.0)));
         float d = luma(samp(vUv - vec2(0.0, uTexel.y)));
         float u = luma(samp(vUv + vec2(0.0, uTexel.y)));
-        float edge = abs(4.0 * y - l - r - d - u);
+        // Dò cạnh trên tín hiệu gốc để LUT không tạo cạnh giả
+        float edge = abs(4.0 * luma(raw) - l - r - d - u);
         if (edge > uPeakThresh) {
             o = uPeakColor;
         }
