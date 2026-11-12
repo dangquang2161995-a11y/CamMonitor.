@@ -25,7 +25,7 @@ class MonitorRenderer(
         /** Gọi trên luồng GL khi SurfaceTexture mới đã sẵn sàng nhận hình. */
         fun onSurfaceTextureReady(surfaceTexture: SurfaceTexture)
 
-        /** Gọi trên luồng GL, bins có HIST_BINS phần tử. */
+        /** Gọi trên luồng GL, bins gồm 4 đoạn HIST_BINS: sáng, đỏ, lục, lam. */
         fun onHistogram(bins: IntArray)
 
         fun onFrameAvailable()
@@ -45,6 +45,15 @@ class MonitorRenderer(
     private var uZebra = 0
     private var uZebraLevel = 0
     private var uTime = 0
+    private var uTex = 0
+    private var uLut = 0
+    private var uLutSize = 0
+    private var uLutOn = 0
+
+    private var lutTex = 0
+    private var lutSize = 0
+    private var lutData: ByteBuffer? = null
+    private var lutDirty = false
 
     private var oesTex = 0
     private var surfaceTexture: SurfaceTexture? = null
@@ -75,7 +84,53 @@ class MonitorRenderer(
         surfaceTexture?.setDefaultBufferSize(w, h)
     }
 
+    /**
+     * Gọi trên luồng GL. Tạo SurfaceTexture mới khi đổi nguồn hình (UVC <-> PC Remote),
+     * vì một surface chỉ nhận được một kiểu nguồn ghi.
+     */
+    fun recreateSurface() {
+        if (oesTex == 0) return
+        surfaceTexture?.release()
+        val st = SurfaceTexture(oesTex)
+        st.setDefaultBufferSize(videoW, videoH)
+        st.setOnFrameAvailableListener(this)
+        surfaceTexture = st
+        listener.onSurfaceTextureReady(st)
+    }
+
+    /** Gọi trên luồng GL (qua queueEvent). Truyền null để gỡ LUT. */
+    fun setLut(size: Int, rgba: ByteBuffer?) {
+        lutSize = if (rgba != null) size else 0
+        lutData = rgba
+        lutDirty = true
+    }
+
+    private fun uploadLut() {
+        lutDirty = false
+        val data = lutData ?: return
+        if (lutTex == 0) {
+            val t = IntArray(1)
+            GLES20.glGenTextures(1, t, 0)
+            lutTex = t[0]
+        }
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        data.position(0)
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, lutSize * lutSize, lutSize, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, data
+        )
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+    }
+
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // Ngữ cảnh GL mới: texture LUT cũ không còn, phải nạp lại
+        lutTex = 0
+        lutDirty = lutData != null
         program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER)
         aPos = GLES20.glGetAttribLocation(program, "aPos")
         uScale = GLES20.glGetUniformLocation(program, "uScale")
@@ -90,6 +145,10 @@ class MonitorRenderer(
         uZebra = GLES20.glGetUniformLocation(program, "uZebra")
         uZebraLevel = GLES20.glGetUniformLocation(program, "uZebraLevel")
         uTime = GLES20.glGetUniformLocation(program, "uTime")
+        uTex = GLES20.glGetUniformLocation(program, "uTex")
+        uLut = GLES20.glGetUniformLocation(program, "uLut")
+        uLutSize = GLES20.glGetUniformLocation(program, "uLutSize")
+        uLutOn = GLES20.glGetUniformLocation(program, "uLutOn")
 
         // Texture nhận hình từ camera
         val t = IntArray(1)
@@ -150,8 +209,9 @@ class MonitorRenderer(
         }
         st.getTransformMatrix(texMatrix)
         frameCount++
+        if (lutDirty) uploadLut()
 
-        if (state.histogram && frameCount % HIST_EVERY == 0) {
+        if (state.histogram != 0 && frameCount % HIST_EVERY == 0) {
             computeHistogram()
         }
 
@@ -178,6 +238,17 @@ class MonitorRenderer(
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
+        GLES20.glUniform1i(uTex, 0)
+
+        val lutActive = state.lutOn && lutTex != 0 && lutSize > 1
+        if (lutActive) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTex)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        }
+        GLES20.glUniform1i(uLut, 1)
+        GLES20.glUniform1f(uLutSize, if (lutActive) lutSize.toFloat() else 2f)
+        GLES20.glUniform1f(uLutOn, if (lutActive) 1f else 0f)
 
         GLES20.glUniform2f(uScale, scaleX, scaleY)
         GLES20.glUniform2f(uUvScale, uvScaleX, uvScaleY)
@@ -218,7 +289,7 @@ class MonitorRenderer(
         )
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
 
-        val bins = IntArray(HIST_BINS)
+        val bins = IntArray(HIST_BINS * 4)
         val total = HIST_W * HIST_H
         var i = 0
         for (p in 0 until total) {
@@ -229,6 +300,9 @@ class MonitorRenderer(
             // Rec.709 luma, hệ số nguyên (tổng 256)
             val y = (54 * r + 183 * g + 19 * b) shr 8
             bins[(y * HIST_BINS) shr 8]++
+            bins[HIST_BINS + ((r * HIST_BINS) shr 8)]++
+            bins[HIST_BINS * 2 + ((g * HIST_BINS) shr 8)]++
+            bins[HIST_BINS * 3 + ((b * HIST_BINS) shr 8)]++
         }
         listener.onHistogram(bins)
     }
@@ -303,6 +377,9 @@ uniform float uPeakThresh;
 uniform float uZebra;
 uniform float uZebraLevel;
 uniform float uTime;
+uniform sampler2D uLut;
+uniform float uLutSize;
+uniform float uLutOn;
 varying vec2 vUv;
 
 float luma(vec3 c) {
@@ -311,6 +388,20 @@ float luma(vec3 c) {
 
 vec3 samp(vec2 uv) {
     return texture2D(uTex, (uTexMatrix * vec4(uv, 0.0, 1.0)).xy).rgb;
+}
+
+// LUT 3D lưu dạng các lát xanh lam xếp ngang; nội suy giữa hai lát kề nhau
+vec3 applyLut(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    float n = uLutSize;
+    float b = c.b * (n - 1.0);
+    float b0 = floor(b);
+    float b1 = min(b0 + 1.0, n - 1.0);
+    float x = (c.r * (n - 1.0) + 0.5) / (n * n);
+    float yy = (c.g * (n - 1.0) + 0.5) / n;
+    vec3 s0 = texture2D(uLut, vec2(x + b0 / n, yy)).rgb;
+    vec3 s1 = texture2D(uLut, vec2(x + b1 / n, yy)).rgb;
+    return mix(s0, s1, b - b0);
 }
 
 vec3 falseColor(float y) {
@@ -331,6 +422,9 @@ void main() {
         return;
     }
     vec3 c = samp(vUv);
+    if (uLutOn > 0.5) {
+        c = applyLut(c);
+    }
     float y = luma(c);
     vec3 o = c;
 

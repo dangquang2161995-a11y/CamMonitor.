@@ -73,7 +73,7 @@ class OverlayView(context: Context, private val state: MonitorState) : View(cont
             drawFrameGuide(canvas, img)
             drawGrid(canvas, img)
         }
-        if (state.histogram) drawHistogram(canvas)
+        if (state.histogram != 0) drawHistogram(canvas)
         if (state.mode == 1) drawFalseColorLegend(canvas)
     }
 
@@ -133,21 +133,40 @@ class OverlayView(context: Context, private val state: MonitorState) : View(cont
         val top = margin
         canvas.drawRect(left, top, left + w, top + h, histBgPaint)
 
+        val n = MonitorRenderer.HIST_BINS
+        if (bins.size < n * 4) return
+        val rgb = state.histogram == 2
+        val first = if (rgb) 1 else 0
+        val last = if (rgb) 3 else 0
+
         var max = 1
         // Bỏ hai đầu khi tìm đỉnh để vùng cháy/đen kịt không làm dẹt biểu đồ
-        for (i in 1 until bins.size - 1) if (bins[i] > max) max = bins[i]
-        val step = w / bins.size
-        path.reset()
-        path.moveTo(left, top + h)
-        for (i in bins.indices) {
-            val v = (bins[i].toFloat() / max).coerceAtMost(1f)
-            val y = top + h - v * h
-            path.lineTo(left + i * step, y)
-            path.lineTo(left + (i + 1) * step, y)
+        for (ch in first..last) {
+            for (i in 1 until n - 1) {
+                val v = bins[ch * n + i]
+                if (v > max) max = v
+            }
         }
-        path.lineTo(left + w, top + h)
-        path.close()
-        canvas.drawPath(path, histPaint)
+        val step = w / n
+        for (ch in first..last) {
+            histPaint.color = when (ch) {
+                1 -> Color.argb(170, 255, 60, 60)
+                2 -> Color.argb(170, 60, 230, 90)
+                3 -> Color.argb(170, 80, 130, 255)
+                else -> Color.argb(230, 255, 255, 255)
+            }
+            path.reset()
+            path.moveTo(left, top + h)
+            for (i in 0 until n) {
+                val v = (bins[ch * n + i].toFloat() / max).coerceAtMost(1f)
+                val y = top + h - v * h
+                path.lineTo(left + i * step, y)
+                path.lineTo(left + (i + 1) * step, y)
+            }
+            path.lineTo(left + w, top + h)
+            path.close()
+            canvas.drawPath(path, histPaint)
+        }
         canvas.drawRect(left, top, left + w, top + h, linePaint)
     }
 

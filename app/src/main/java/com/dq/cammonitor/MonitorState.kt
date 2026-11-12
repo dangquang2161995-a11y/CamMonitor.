@@ -17,7 +17,11 @@ class MonitorState {
     /** 0 = tắt, 1 = 70%, 2 = 95%, 3 = 100% */
     @Volatile var zebra = 0
 
-    @Volatile var histogram = false
+    /** 0 = tắt, 1 = độ sáng, 2 = RGB */
+    @Volatile var histogram = 0
+
+    /** Bật/tắt LUT 3D đã nạp */
+    @Volatile var lutOn = false
 
     /** chỉ số trong ZOOMS */
     @Volatile var zoom = 0
