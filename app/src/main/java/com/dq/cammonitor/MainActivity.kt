@@ -22,6 +22,8 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.Build
@@ -178,6 +180,32 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
 
     private var uvcSizePref = ""
 
+    // ---- đếm ngược trước khi quay/chụp
+    private lateinit var countdownText: TextView
+    private var countdownIndex = 0
+    private var countdownLeft = 0
+    private var countdownAction: (() -> Unit)? = null
+    private val countdownTick = object : Runnable {
+        override fun run() {
+            if (countdownAction == null) return
+            countdownLeft--
+            if (countdownLeft <= 0) {
+                val action = countdownAction
+                cancelCountdown()
+                action?.invoke()
+            } else {
+                countdownText.text = countdownLeft.toString()
+                handler.postDelayed(this, 1000)
+            }
+        }
+    }
+
+    // ---- danh sách cảnh quay
+    private lateinit var shotText: TextView
+    private val shotNames = ArrayList<String>()
+    private val shotDone = ArrayList<Boolean>()
+    private var recordAudio = false
+
     /** Surface đang được dùng bởi: 0 = chưa ai, 1 = UVC, 2 = PC Remote */
     private var surfaceUse = 0
     private var surfaceRecreating = false
@@ -309,6 +337,31 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         camLp.leftMargin = dp(8)
         root.addView(camInfoText, camLp)
 
+        // Cảnh quay kế tiếp ở góc trên phải; chạm vào để đánh dấu đã quay xong
+        shotText = TextView(this)
+        shotText.setTextColor(Color.WHITE)
+        shotText.textSize = 13f
+        shotText.maxLines = 2
+        shotText.maxWidth = dp(260)
+        shotText.setPadding(dp(8), dp(4), dp(8), dp(4))
+        shotText.setBackgroundColor(Color.argb(140, 0, 60, 110))
+        shotText.visibility = View.GONE
+        shotText.setOnClickListener { if (!locked) markCurrentShotDone() }
+        val shotLp = wrap(Gravity.TOP or Gravity.END)
+        shotLp.topMargin = dp(28)
+        shotLp.rightMargin = dp(8)
+        root.addView(shotText, shotLp)
+
+        countdownText = TextView(this)
+        countdownText.setTextColor(Color.WHITE)
+        countdownText.textSize = 140f
+        countdownText.setShadowLayer(12f, 0f, 0f, Color.BLACK)
+        countdownText.gravity = Gravity.CENTER
+        countdownText.visibility = View.GONE
+        // Chạm vào số đang đếm để hủy
+        countdownText.setOnClickListener { cancelCountdown() }
+        root.addView(countdownText, wrap(Gravity.CENTER))
+
         diagText = TextView(this)
         diagText.setTextColor(Color.argb(255, 140, 255, 160))
         diagText.textSize = 10f
@@ -362,6 +415,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
 
         overlay.setOnTouchListener { _, event -> handleTouch(event) }
         setContentView(root)
+        refreshShotText()
         updateBars()
     }
 
@@ -400,6 +454,14 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         addButton(row, { frameLabel() }, { showCustomRatioDialog() }) {
             state.frame = (state.frame + 1) % MonitorState.FRAME_NAMES.size
         }
+        addButton(row, { "Ba khung 9:16·4:5·1:1: " + onOff(state.multiFrame) }) {
+            state.multiFrame = !state.multiFrame
+        }
+        addButton(row, { "Vùng an toàn: " + MonitorState.SAFE_NAMES[state.safeZone] }) {
+            state.safeZone = (state.safeZone + 1) % MonitorState.SAFE_NAMES.size
+        }
+        // Chạm: xem và tick cảnh. Giữ lâu: sửa danh sách.
+        addButton(row, { shotLabel() }, { showShotEditor() }) { showShotList() }
         addButton(row, { "Mờ ngoài khung: " + MonitorState.DIM_NAMES[state.dim] }) {
             state.dim = (state.dim + 1) % MonitorState.DIM_NAMES.size
         }
@@ -445,6 +507,17 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         addButton(row, { if (previewRecording) "■ Dừng ghi preview" else "● Ghi preview" }) {
             togglePreviewRecording()
         }
+        addButton(row, { "Thu tiếng khi ghi: " + onOff(recordAudio) }) {
+            if (!recordAudio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_AUDIO)
+            } else {
+                recordAudio = !recordAudio
+                prefs.edit().putBoolean("recordAudio", recordAudio).apply()
+                if (recordAudio) {
+                    toast("Bản ghi preview sẽ có tiếng: lấy từ capture card HDMI nếu điện thoại nhận được, không thì từ micro điện thoại.")
+                }
+            }
+        }
         addButton(row, { "Sáng tối đa: " + onOff(state.maxBright) }) {
             state.maxBright = !state.maxBright
             applyBrightness()
@@ -477,9 +550,19 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         row.setPadding(dp(6), dp(4), dp(6), dp(4))
 
         addButton(row, { if (lastInfo?.recording == true) "■ Dừng quay" else "● Quay" }) {
-            sonyRemote?.toggleRecord()
+            if (lastInfo?.recording == true) {
+                // Dừng quay thì làm ngay, không đếm
+                cancelCountdown()
+                sonyRemote?.toggleRecord()
+            } else {
+                withCountdown { sonyRemote?.toggleRecord() }
+            }
         }
-        addButton(row, { "Chụp ảnh" }) { sonyRemote?.capturePhoto() }
+        addButton(row, { "Chụp ảnh" }) { withCountdown { sonyRemote?.capturePhoto() } }
+        addButton(row, { "Đếm ngược: " + COUNTDOWN_NAMES[countdownIndex] }) {
+            countdownIndex = (countdownIndex + 1) % COUNTDOWN_NAMES.size
+            prefs.edit().putInt("countdown", countdownIndex).apply()
+        }
         // Chạm: bắt đầu hoặc dừng. Giữ lâu: đặt lại khoảng cách và số ảnh.
         addButton(row, { intervalLabel() }, { showIntervalDialog() }) {
             if (intervalOn) stopInterval("Đã dừng chụp hẹn giờ sau " + intervalDone + " ảnh") else showIntervalDialog()
@@ -1101,14 +1184,29 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         val dir = getExternalFilesDir(null) ?: filesDir
         val file = File(dir, "CamMonitor_" + timestamp() + ".mp4")
         val hint = state.rotation * 90
-        glView.queueEvent { renderer.startRecording(file, hint) }
+        val audio = recordAudio && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val device = if (audio) usbAudioInput() else null
+        glView.queueEvent { renderer.startRecording(file, hint, audio, device) }
     }
 
-    override fun onRecordingStarted() {
+    /** Đầu thu tiếng qua USB (tiếng HDMI của capture card), hoặc null nếu điện thoại không thấy. */
+    private fun usbAudioInput(): AudioDeviceInfo? {
+        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
+        for (d in am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
+            if (d.type == AudioDeviceInfo.TYPE_USB_DEVICE || d.type == AudioDeviceInfo.TYPE_USB_HEADSET) return d
+        }
+        return null
+    }
+
+    override fun onRecordingStarted(audioNote: String?) {
         runOnUiThread {
             previewRecording = true
             overlay.previewRecording = true
             afterChange()
+            if (audioNote != null) {
+                toast("Đang ghi preview. $audioNote")
+                logEvent("Ghi preview: $audioNote")
+            }
         }
     }
 
@@ -1197,6 +1295,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         handler.removeCallbacks(diagTick)
         handler.removeCallbacks(unlockRunnable)
         if (intervalOn) stopInterval(null)
+        cancelCountdown()
         prompter.pause()
         stopWebServer()
         if (previewRecording) glView.queueEvent { renderer.stopRecording() }
@@ -1215,6 +1314,13 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_AUDIO) {
+            recordAudio = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            prefs.edit().putBoolean("recordAudio", recordAudio).apply()
+            if (!recordAudio) toast("Chưa có quyền Micro nên bản ghi preview sẽ không có tiếng")
+            for (u in labelUpdaters) u()
+            return
+        }
         if (requestCode != REQ_CAMERA) return
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             initCamera()
@@ -1706,6 +1812,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             lastInfo = null
             recStartAt = 0L
             if (intervalOn) stopInterval("Dừng chụp hẹn giờ: mất kết nối máy ảnh")
+            cancelCountdown()
             overlay.cameraRecording = false
             camInfoText.visibility = View.GONE
             updateBars()
@@ -1751,6 +1858,138 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         }
         sb.append("\nTổng số thuộc tính: ").append(raw.size)
         dialog().setTitle("Chẩn đoán máy ảnh").setMessage(sb.toString()).setPositiveButton("Đóng", null).show()
+    }
+
+    // ================================================================ đếm ngược trước khi quay/chụp
+
+    /** Chạy [action] ngay, hoặc sau khi đếm ngược nếu đang bật. Bấm lần nữa khi đang đếm thì hủy. */
+    private fun withCountdown(action: () -> Unit) {
+        if (countdownAction != null) {
+            cancelCountdown()
+            toast("Đã hủy đếm ngược")
+            return
+        }
+        val seconds = COUNTDOWN_SECONDS[countdownIndex]
+        if (seconds <= 0 || sonyRemote == null) {
+            action()
+            return
+        }
+        countdownAction = action
+        countdownLeft = seconds
+        countdownText.text = seconds.toString()
+        countdownText.visibility = View.VISIBLE
+        handler.removeCallbacks(countdownTick)
+        handler.postDelayed(countdownTick, 1000)
+    }
+
+    private fun cancelCountdown() {
+        countdownAction = null
+        handler.removeCallbacks(countdownTick)
+        countdownText.visibility = View.GONE
+    }
+
+    // ================================================================ danh sách cảnh quay
+
+    private fun loadShots() {
+        shotNames.clear()
+        shotDone.clear()
+        val saved = prefs.getString("shotList", "") ?: ""
+        for (line in saved.split('\n')) {
+            if (line.length < 3 || line[1] != '|') continue
+            shotNames.add(line.substring(2))
+            shotDone.add(line[0] == '1')
+        }
+    }
+
+    private fun saveShots() {
+        val sb = StringBuilder()
+        for (i in shotNames.indices) {
+            sb.append(if (shotDone[i]) '1' else '0').append('|').append(shotNames[i]).append('\n')
+        }
+        prefs.edit().putString("shotList", sb.toString()).apply()
+    }
+
+    private fun shotsDoneCount(): Int = shotDone.count { it }
+
+    private fun shotLabel(): String {
+        if (shotNames.isEmpty()) return "Cảnh quay"
+        return "Cảnh quay " + shotsDoneCount() + "/" + shotNames.size
+    }
+
+    /** Cập nhật ô "cảnh kế tiếp" ở góc trên phải. */
+    private fun refreshShotText() {
+        val next = shotDone.indexOf(false)
+        if (shotNames.isEmpty()) {
+            shotText.visibility = View.GONE
+        } else if (next < 0) {
+            shotText.text = "✓ Đã quay đủ " + shotNames.size + " cảnh"
+            shotText.visibility = View.VISIBLE
+        } else {
+            shotText.text = "Cảnh " + (next + 1) + "/" + shotNames.size + ": " + shotNames[next] + "\n(chạm khi quay xong)"
+            shotText.visibility = View.VISIBLE
+        }
+        for (u in labelUpdaters) u()
+    }
+
+    private fun markCurrentShotDone() {
+        val next = shotDone.indexOf(false)
+        if (next < 0) return
+        shotDone[next] = true
+        saveShots()
+        refreshShotText()
+    }
+
+    private fun showShotList() {
+        if (shotNames.isEmpty()) {
+            showShotEditor()
+            return
+        }
+        val names = Array(shotNames.size) { (it + 1).toString() + ". " + shotNames[it] }
+        val checked = BooleanArray(shotNames.size) { shotDone[it] }
+        dialog().setTitle("Danh sách cảnh quay")
+            .setMultiChoiceItems(names, checked) { _, which, isChecked ->
+                if (which in shotDone.indices) {
+                    shotDone[which] = isChecked
+                    saveShots()
+                    refreshShotText()
+                }
+            }
+            .setPositiveButton("Đóng", null)
+            .setNeutralButton("Sửa danh sách") { _, _ -> showShotEditor() }
+            .setNegativeButton("Bỏ tick hết") { _, _ ->
+                for (i in shotDone.indices) shotDone[i] = false
+                saveShots()
+                refreshShotText()
+            }
+            .show()
+    }
+
+    private fun showShotEditor() {
+        val input = EditText(this)
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        input.minLines = 5
+        input.maxLines = 10
+        input.gravity = Gravity.TOP or Gravity.START
+        input.hint = "Mỗi dòng một cảnh, ví dụ:\nToàn cảnh quán\nCận tay pha cà phê\nKhách cầm ly cười"
+        input.setText(shotNames.joinToString("\n"))
+        dialog().setTitle("Sửa danh sách cảnh quay").setView(input)
+            .setPositiveButton("Lưu") { _, _ ->
+                // Cảnh nào giữ nguyên tên thì giữ nguyên trạng thái đã quay
+                val old = HashMap<String, Boolean>()
+                for (i in shotNames.indices) old[shotNames[i]] = shotDone[i]
+                shotNames.clear()
+                shotDone.clear()
+                for (line in input.text.toString().split('\n')) {
+                    val name = line.trim()
+                    if (name.isEmpty() || shotNames.size >= 200) continue
+                    shotNames.add(name)
+                    shotDone.add(old[name] ?: false)
+                }
+                saveShots()
+                refreshShotText()
+            }
+            .setNegativeButton("Hủy", null)
+            .show()
     }
 
     // ================================================================ chụp theo khoảng thời gian
@@ -2156,6 +2395,9 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         showTools = prefs.getBoolean("showTools", true)
         showCamera = prefs.getBoolean("showCamera", true)
         saveShots = prefs.getBoolean("saveShots", true)
+        recordAudio = prefs.getBoolean("recordAudio", false)
+        countdownIndex = prefs.getInt("countdown", 0).coerceIn(0, COUNTDOWN_NAMES.size - 1)
+        loadShots()
         intervalSec = prefs.getInt("intervalSec", 5)
         intervalTotal = prefs.getInt("intervalTotal", 0)
         uvcSizePref = prefs.getString("uvcSize", "") ?: ""
@@ -2183,8 +2425,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         private const val REQ_CAMERA = 1
         private const val REQ_LUT = 2
         private const val REQ_ONION = 3
+        private const val REQ_AUDIO = 4
         private const val BATTERY_LOW = 20
         private const val WEB_PORT = 8080
+        private val COUNTDOWN_NAMES = arrayOf("Tắt", "3 giây", "5 giây", "10 giây")
+        private val COUNTDOWN_SECONDS = intArrayOf(0, 3, 5, 10)
         private const val MF_SMALL = 1
         private const val MF_BIG = 5
         private val WEB_NAMES = arrayOf("Tắt", "Chỉ xem", "Điều khiển")

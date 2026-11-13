@@ -33,7 +33,7 @@ class MonitorRenderer(
         /** Khung hình sạch độ phân giải gốc (RGBA, hàng 0 là đáy hình). */
         fun onCapture(pixels: ByteBuffer, width: Int, height: Int, purpose: Int)
 
-        fun onRecordingStarted()
+        fun onRecordingStarted(audioNote: String?)
         fun onRecordingStopped(file: File?, error: String?)
     }
 
@@ -125,18 +125,19 @@ class MonitorRenderer(
     }
 
     /** Gọi trên luồng GL. */
-    fun startRecording(file: File, orientationHint: Int) {
+    fun startRecording(file: File, orientationHint: Int, withAudio: Boolean, audioDevice: android.media.AudioDeviceInfo?) {
         if (recorder != null) return
         try {
             val w = videoW and 1.inv()
             val h = videoH and 1.inv()
-            recorder = try {
-                PreviewRecorder(w, h, file, orientationHint)
+            val rec = try {
+                PreviewRecorder(w, h, file, orientationHint, withAudio, audioDevice)
             } catch (first: Exception) {
                 // Một số bộ mã hoá chỉ nhận kích thước chia hết cho 16
-                PreviewRecorder(w and 15.inv(), h and 15.inv(), file, orientationHint)
+                PreviewRecorder(w and 15.inv(), h and 15.inv(), file, orientationHint, withAudio, audioDevice)
             }
-            listener.onRecordingStarted()
+            recorder = rec
+            listener.onRecordingStarted(rec.audioNote)
         } catch (e: Exception) {
             recorder = null
             listener.onRecordingStopped(null, e.message ?: "Không khởi tạo được bộ ghi hình")

@@ -58,6 +58,12 @@ class MonitorState {
     /** Ảnh mẫu chồng lên hình: 0 = tắt, 1..3 = độ đậm */
     @Volatile var onion = 0
 
+    /** Vùng an toàn của mạng xã hội trên khung 9:16: chỉ số trong SAFE_NAMES, 0 = tắt */
+    @Volatile var safeZone = 0
+
+    /** Hiện đồng thời ba khung 9:16, 4:5 và 1:1 */
+    @Volatile var multiFrame = false
+
     @Volatile var touchAf = false
     @Volatile var maxBright = false
 
@@ -115,6 +121,8 @@ class MonitorState {
         put("level", if (level) 1 else 0)
         put("onion", onion)
         put("touchAf", if (touchAf) 1 else 0)
+        put("safe", safeZone)
+        put("multi", if (multiFrame) 1 else 0)
         put("maxBright", if (maxBright) 1 else 0)
         put("ratio1000", (customRatio * 1000f).toInt())
         return sb.toString()
@@ -148,6 +156,8 @@ class MonitorState {
         level = get("level", 0, 1) == 1
         onion = get("onion", 0, 3)
         touchAf = get("touchAf", 0, 1) == 1
+        safeZone = get("safe", 0, SAFE_NAMES.size - 1)
+        multiFrame = get("multi", 0, 1) == 1
         maxBright = get("maxBright", 0, 1) == 1
         customRatio = (get("ratio1000", 750, 10000) / 1000f).coerceIn(0.2f, 5f)
         zoom = 0
@@ -162,6 +172,20 @@ class MonitorState {
         /** Tỉ lệ khung (rộng / cao); phần tử 0 là "tắt" */
         val FRAMES = floatArrayOf(0f, 9f / 16f, 4f / 5f, 1f, 3f / 4f, 16f / 9f, 1.91f, 2.35f)
         val FRAME_NAMES = arrayOf("Tắt", "9:16", "4:5", "1:1", "3:4", "16:9", "1.91:1", "2.35:1", "Tự nhập")
+
+        val SAFE_NAMES = arrayOf("Tắt", "TikTok", "Reels", "Shorts")
+
+        /**
+         * Phần khung 9:16 bị giao diện ứng dụng che, theo thứ tự trên, dưới, trái, phải
+         * (tỉ lệ so với cạnh khung). Đây là số ước lượng: các ứng dụng đổi giao diện thường
+         * xuyên và phần chú thích dài ngắn khác nhau, nên chừa rộng hơn một chút cho chắc.
+         */
+        val SAFE_INSETS = arrayOf(
+            floatArrayOf(0f, 0f, 0f, 0f),
+            floatArrayOf(0.08f, 0.22f, 0.04f, 0.14f),
+            floatArrayOf(0.12f, 0.24f, 0.04f, 0.13f),
+            floatArrayOf(0.10f, 0.26f, 0.04f, 0.14f)
+        )
 
         /** Độ tối phần ngoài khung (alpha 0..255) */
         val DIM_ALPHA = intArrayOf(0, 64, 128, 191, 255)

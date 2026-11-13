@@ -126,6 +126,8 @@ class OverlayView(context: Context, private val state: MonitorState) : View(cont
         if (state.zoom == 0) {
             drawOnion(canvas)
             drawFrameGuide(canvas)
+            if (state.multiFrame) drawMultiFrames(canvas)
+            if (state.safeZone > 0) drawSafeZone(canvas)
             drawGrid(canvas)
         }
         if (state.level) drawLevel(canvas)
@@ -168,6 +170,73 @@ class OverlayView(context: Context, private val state: MonitorState) : View(cont
             dst.set(img.centerX() - w / 2f, img.centerY() - h / 2f, img.centerX() + w / 2f, img.centerY() + h / 2f)
             canvas.drawBitmap(bmp, null, dst, onionPaint)
         }
+    }
+
+    /** Khung lớn nhất có tỉ lệ [ratio] (rộng/cao) nằm giữa vùng ảnh. */
+    private fun centeredFrame(ratio: Float, out: RectF) {
+        val imgAspect = img.width() / img.height()
+        val fw: Float
+        val fh: Float
+        if (ratio < imgAspect) {
+            fh = img.height()
+            fw = fh * ratio
+        } else {
+            fw = img.width()
+            fh = fw / ratio
+        }
+        out.set(img.centerX() - fw / 2f, img.centerY() - fh / 2f, img.centerX() + fw / 2f, img.centerY() + fh / 2f)
+    }
+
+    /** Ba khung 9:16, 4:5, 1:1 cùng lúc, mỗi khung một màu, để quay một lần cắt được nhiều nơi. */
+    private fun drawMultiFrames(canvas: Canvas) {
+        val oldColor = framePaint.color
+        val oldWidth = framePaint.strokeWidth
+        val oldText = textPaint.color
+        framePaint.strokeWidth = 1.5f * density
+        for (i in MULTI_RATIOS.indices) {
+            centeredFrame(MULTI_RATIOS[i], dst)
+            framePaint.color = MULTI_COLORS[i]
+            canvas.drawRect(dst, framePaint)
+            textPaint.color = MULTI_COLORS[i]
+            // Xếp nhãn lệch nhau để không đè lên nhau khi các khung trùng mép
+            canvas.drawText(MULTI_NAMES[i], dst.left + 5f * density, dst.top + (14f + 13f * i) * density, textPaint)
+        }
+        framePaint.color = oldColor
+        framePaint.strokeWidth = oldWidth
+        textPaint.color = oldText
+    }
+
+    /** Tô đỏ phần khung 9:16 bị giao diện mạng xã hội che, viền xanh quanh vùng an toàn. */
+    private fun drawSafeZone(canvas: Canvas) {
+        val index = state.safeZone.coerceIn(0, MonitorState.SAFE_INSETS.size - 1)
+        if (index == 0) return
+        val inset = MonitorState.SAFE_INSETS[index]
+        centeredFrame(9f / 16f, dst)
+        val l = dst.left
+        val t = dst.top
+        val r = dst.right
+        val b = dst.bottom
+        val safeT = t + dst.height() * inset[0]
+        val safeB = b - dst.height() * inset[1]
+        val safeL = l + dst.width() * inset[2]
+        val safeR = r - dst.width() * inset[3]
+        dimPaint.color = Color.argb(95, 255, 40, 40)
+        canvas.drawRect(l, t, r, safeT, dimPaint)
+        canvas.drawRect(l, safeB, r, b, dimPaint)
+        canvas.drawRect(l, safeT, safeL, safeB, dimPaint)
+        canvas.drawRect(safeR, safeT, r, safeB, dimPaint)
+        val oldColor = framePaint.color
+        val oldWidth = framePaint.strokeWidth
+        framePaint.color = Color.argb(255, 90, 255, 120)
+        framePaint.strokeWidth = 1.5f * density
+        canvas.drawRect(safeL, safeT, safeR, safeB, framePaint)
+        framePaint.color = Color.argb(200, 255, 255, 255)
+        framePaint.strokeWidth = 1f * density
+        canvas.drawRect(l, t, r, b, framePaint)
+        framePaint.color = oldColor
+        framePaint.strokeWidth = oldWidth
+        val label = "Vùng an toàn " + MonitorState.SAFE_NAMES[index]
+        canvas.drawText(label, safeL + 5f * density, safeB - 6f * density, textPaint)
     }
 
     private fun drawFrameGuide(canvas: Canvas) {
@@ -445,6 +514,14 @@ class OverlayView(context: Context, private val state: MonitorState) : View(cont
     }
 
     companion object {
+        private val MULTI_RATIOS = floatArrayOf(9f / 16f, 4f / 5f, 1f)
+        private val MULTI_NAMES = arrayOf("9:16", "4:5", "1:1")
+        private val MULTI_COLORS = intArrayOf(
+            Color.argb(255, 60, 220, 255),
+            Color.argb(255, 255, 110, 220),
+            Color.argb(255, 120, 255, 120)
+        )
+
         private const val HIST_BINS = 64
         private const val WAVE_W = 128
         private const val WAVE_H = 64
