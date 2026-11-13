@@ -58,4 +58,46 @@ object MediaSaver {
             return null
         }
     }
+
+    /**
+     * Chuyển file ảnh vừa tải từ máy ảnh vào thư viện, giữ nguyên dữ liệu gốc.
+     * Trả về mô tả nơi lưu, hoặc null nếu lỗi. File tạm luôn được xoá.
+     */
+    fun publishPhoto(context: Context, file: File, name: String): String? {
+        try {
+            val lower = name.lowercase()
+            val mime = when {
+                lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
+                lower.endsWith(".hif") || lower.endsWith(".heif") || lower.endsWith(".heic") -> "image/heif"
+                lower.endsWith(".arw") -> "image/x-sony-arw"
+                else -> "application/octet-stream"
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues()
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                values.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                val resolver = context.contentResolver
+                val isImage = mime.startsWith("image/")
+                val collection = if (isImage) {
+                    values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/" + FOLDER)
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                } else {
+                    values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/" + FOLDER)
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                }
+                val uri = resolver.insert(collection, values) ?: return null
+                val out = resolver.openOutputStream(uri) ?: return null
+                out.use { o -> FileInputStream(file).use { i -> i.copyTo(o) } }
+                return if (isImage) "Thư viện ảnh, album " + FOLDER else "Thư mục Download/" + FOLDER
+            }
+            val dir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return null
+            val dest = File(dir, name)
+            FileOutputStream(dest).use { o -> FileInputStream(file).use { i -> i.copyTo(o) } }
+            return dest.absolutePath
+        } catch (e: Exception) {
+            return null
+        } finally {
+            file.delete()
+        }
+    }
 }

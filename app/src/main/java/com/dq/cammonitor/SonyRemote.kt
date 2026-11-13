@@ -8,7 +8,11 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.SystemClock
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -25,6 +29,12 @@ class SonyInfo {
     /** Máy ảnh có báo trạng thái quay hay không (một số đời máy không gửi). */
     var recordingKnown = false
     var wbOptions = IntArray(0)
+
+    /** Lớn hơn 0x8000 nghĩa là máy ảnh đang giữ một ảnh vừa chụp, chờ app lấy về. */
+    var objectInMemory = 0
+
+    /** Giá trị thô của mọi thuộc tính dạng số, dùng cho bảng chẩn đoán. */
+    val raw = HashMap<Int, Long>()
 
     fun shutterText(): String {
         if (shutter < 0) return "--"
@@ -81,19 +91,47 @@ class SonyInfo {
 class SonyRemote(
     private val usb: UsbManager,
     private val device: UsbDevice,
-    private val listener: Listener
+    private val listener: Listener,
+    /** false = chỉ điều khiển và đọc thông số, không lấy hình (khi hình đi qua HDMI). */
+    private val liveView: Boolean,
+    /** Thư mục tạm để ghi ảnh chụp tải về từ máy ảnh. */
+    private val tempDir: File
 ) {
     /** Các hàm này được gọi trên luồng riêng của SonyRemote, không phải luồng giao diện. */
     interface Listener {
         fun onRemoteLog(msg: String)
         fun onRemoteFrame(data: ByteArray, offset: Int, length: Int)
         fun onRemoteInfo(info: SonyInfo)
+
+        /** Bắt tay xong, đã gửi được lệnh điều khiển. */
+        fun onRemoteReady(liveView: Boolean)
+
+        /** Đã tải xong một ảnh vừa chụp vào file tạm; bên nhận tự chuyển vào thư viện rồi xoá. */
+        fun onRemoteImage(file: File, name: String)
         fun onRemoteStopped(error: String?)
     }
 
     @Volatile private var running = false
     private var thread: Thread? = null
+
+    // Số đo để tìm chỗ nghẽn fps; luồng giao diện đọc rồi đặt về 0 mỗi giây
+    @Volatile var statFrames = 0
+    @Volatile var statMisses = 0
+    @Volatile var statFetchMs = 0L
+    @Volatile var statBytes = 0L
     private val pending = ConcurrentLinkedQueue<() -> Unit>()
+
+    /** true: ảnh vừa chụp được lưu về điện thoại; false: vẫn lấy khỏi máy ảnh nhưng bỏ đi. */
+    @Volatile var saveImages = true
+
+    /** Bản chụp giá trị thô của các thuộc tính ở lần đọc gần nhất. */
+    @Volatile var lastRaw: Map<Int, Long> = emptyMap()
+
+    // Khi khác null, khối dữ liệu nhận về được ghi thẳng ra đây thay vì vào bộ nhớ
+    private var sink: OutputStream? = null
+    private var sinkFailed = false
+    private var fetchFailures = 0
+    private var fetchDisabled = false
 
     private var conn: UsbDeviceConnection? = null
     private var epIn: UsbEndpoint? = null
@@ -139,6 +177,11 @@ class SonyRemote(
     /** Tăng/giảm một nấc: dùng cho ISO, tốc, khẩu, bù sáng. */
     fun stepValue(prop: Int, up: Boolean) {
         pending.add { control(OC_SONY_CONTROL_B, prop, 1, if (up) 0x01 else 0xFF) }
+    }
+
+    /** Chất lượng hình xem trực tiếp: thấp thì file nhỏ hơn và thường nhiều khung hình hơn. */
+    fun setLiveViewQuality(low: Boolean) {
+        pending.add { control(OC_SONY_SET_A, PROP_LIVEVIEW_QUALITY, 1, if (low) 1 else 2) }
     }
 
     fun setWhiteBalance(value: Int) {
@@ -193,6 +236,16 @@ class SonyRemote(
         }
     }
 
+    /**
+     * Chỉnh nét tay: [step] từ -7 (về gần, bước lớn) đến 7 (ra xa, bước lớn).
+     * Máy ảnh phải đang ở MF hoặc DMF.
+     */
+    fun manualFocus(step: Int) {
+        val v = step.coerceIn(-7, 7)
+        if (v == 0) return
+        pending.add { control(OC_SONY_CONTROL_B, PROP_NEAR_FAR, 2, v and 0xFFFF) }
+    }
+
     /** Đặt điểm lấy nét; x trong 0..639, y trong 0..479 (hệ toạ độ của Sony). */
     fun touchFocus(x: Int, y: Int) {
         val cx = x.coerceIn(0, 639)
@@ -245,7 +298,8 @@ class SonyRemote(
             expectOk("SDIO Connect 2", transact(OC_SONY_CONNECT, 2, 0, 0))
             expectOk("GetExtDeviceInfo", transact(OC_SONY_GET_EXT_INFO, 0x00C8))
             expectOk("SDIO Connect 3", transact(OC_SONY_CONNECT, 3, 0, 0))
-            listener.onRemoteLog("Sony: bắt tay xong, đang lấy hình")
+            listener.onRemoteLog(if (liveView) "Sony: bắt tay xong, đang lấy hình" else "Sony: bắt tay xong, chỉ điều khiển")
+            listener.onRemoteReady(liveView)
 
             // 3. Vòng lặp: lấy ảnh live view, chạy lệnh đang chờ, đọc thông số định kỳ
             var misses = 0
@@ -262,10 +316,16 @@ class SonyRemote(
                     control(OC_SONY_CONTROL_B, PROP_SHUTTER_HALF, 2, 1)
                 }
                 if (now >= nextInfoAt) {
-                    nextInfoAt = now + 1000
-                    pollInfo()
+                    nextInfoAt = now + (if (liveView) 1000 else 500)
+                    // Vừa lấy xong một ảnh thì kiểm tra lại ngay, vì RAW+JPEG cho hai file
+                    if (pollInfo()) nextInfoAt = now + 150
+                }
+                if (!liveView) {
+                    sleepQuietly(40)
+                    continue
                 }
 
+                val t0 = SystemClock.elapsedRealtime()
                 val rc = transact(OC_GET_OBJECT, LIVEVIEW_HANDLE)
                 var delivered = false
                 if (rc == RC_OK && dataLen > 16) {
@@ -276,6 +336,9 @@ class SonyRemote(
                         if (start == le32(data, 0) && declared > 0 && start + declared <= dataLen) {
                             len = declared
                         }
+                        statFetchMs += SystemClock.elapsedRealtime() - t0
+                        statBytes += len
+                        statFrames++
                         listener.onRemoteFrame(data, start, len)
                         delivered = true
                     }
@@ -285,6 +348,7 @@ class SonyRemote(
                 } else {
                     // Máy ảnh trả AccessDenied khi chưa có khung hình mới
                     misses++
+                    statMisses++
                     if (misses > 150 && !warned) {
                         warned = true
                         listener.onRemoteLog("Máy ảnh chưa trả hình (mã 0x" + Integer.toHexString(rc) + ")")
@@ -362,10 +426,12 @@ class SonyRemote(
 
     // ------------------------------------------------------------ đọc thông số
 
-    private fun pollInfo() {
+    /** Đọc thông số máy ảnh. Trả về true nếu vừa lấy về một ảnh chụp. */
+    private fun pollInfo(): Boolean {
         val rc = transact(OC_SONY_GET_ALL_PROPS)
-        if (rc != RC_OK || dataLen <= 8) return
+        if (rc != RC_OK || dataLen <= 8) return false
         val info = parseInfo()
+        lastRaw = info.raw
         // Đồng bộ trạng thái nút quay với máy ảnh (chờ 2 giây sau lần bấm gần nhất)
         if (info.recordingKnown && SystemClock.elapsedRealtime() - movieToggledAt > 2000) {
             movieHeld = info.recording
@@ -374,6 +440,95 @@ class SonyRemote(
         if (sig != lastInfoSignature) {
             lastInfoSignature = sig
             listener.onRemoteInfo(info)
+        }
+        if (info.objectInMemory > 0x8000 && !fetchDisabled) {
+            if (fetchCapturedImage()) {
+                fetchFailures = 0
+                return true
+            }
+            fetchFailures++
+            if (fetchFailures >= 3) {
+                fetchDisabled = true
+                listener.onRemoteLog("Ngừng thử tải ảnh chụp trong phiên này vì máy ảnh từ chối 3 lần")
+            }
+        }
+        return false
+    }
+
+    /**
+     * Lấy ảnh vừa chụp mà máy ảnh đang giữ trong bộ nhớ đệm (chỉ có khi trên máy đặt
+     * "Still Img. Save Dest." là PC+Camera hoặc PC Only). Phải lấy đi thì máy mới chụp tiếp.
+     */
+    private fun fetchCapturedImage(): Boolean {
+        var name = "DSC_" + System.currentTimeMillis() + ".JPG"
+        if (transact(OC_GET_OBJECT_INFO, CAPTURE_HANDLE) == RC_OK && dataLen > 53) {
+            // Tên file nằm sau 52 byte đầu: 1 byte số ký tự rồi các ký tự 2 byte
+            val n = data[52].toInt() and 0xFF
+            if (n > 1 && 53 + n * 2 <= dataLen) {
+                val sb = StringBuilder()
+                for (i in 0 until n) {
+                    val ch = le16(data, 53 + i * 2)
+                    if (ch == 0) break
+                    sb.append(ch.toChar())
+                }
+                if (sb.isNotEmpty()) name = sb.toString()
+            }
+        }
+        val file = if (saveImages) File(tempDir, "ptp_" + System.nanoTime() + ".tmp") else null
+        var out: OutputStream? = null
+        var ok = false
+        try {
+            var openFailed = false
+            out = if (file != null) {
+                try {
+                    BufferedOutputStream(FileOutputStream(file), 65536)
+                } catch (e: IOException) {
+                    openFailed = true
+                    DiscardStream()
+                }
+            } else {
+                DiscardStream()
+            }
+            sink = out
+            sinkFailed = openFailed
+            val rc = transact(OC_GET_OBJECT, CAPTURE_HANDLE)
+            ok = rc == RC_OK && !sinkFailed
+            if (rc != RC_OK && fetchFailures == 0) {
+                listener.onRemoteLog("Không lấy được ảnh chụp (mã 0x" + Integer.toHexString(rc) + ")")
+            }
+            if (sinkFailed) listener.onRemoteLog("Không ghi được ảnh vào bộ nhớ điện thoại")
+            // Ghi hỏng nhưng máy ảnh đã nhả ảnh thì vẫn tính là đã lấy xong
+            return rc == RC_OK
+        } finally {
+            sink = null
+            try {
+                out?.close()
+            } catch (e: IOException) {
+                ok = false
+            }
+            if (file != null) {
+                if (ok && file.length() > 0) listener.onRemoteImage(file, name) else file.delete()
+            }
+        }
+    }
+
+    private class DiscardStream : OutputStream() {
+        override fun write(b: Int) {
+            // bỏ
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            // bỏ
+        }
+    }
+
+    private fun writeSink(out: OutputStream, buf: ByteArray, off: Int, len: Int) {
+        if (sinkFailed || len <= 0) return
+        try {
+            out.write(buf, off, len)
+        } catch (e: IOException) {
+            // Vẫn phải đọc hết dữ liệu USB để không làm kẹt phiên
+            sinkFailed = true
         }
     }
 
@@ -442,6 +597,7 @@ class SonyRemote(
             if (afterCur < 0) break
             val size = numericSize(type)
             val current = if (size in 1..4) readNumber(curOff, type) else 0L
+            if (size in 1..4) info.raw[code] = current
             off = afterCur
             if (off + 1 > end) break
             val form = data[off].toInt() and 0xFF
@@ -512,6 +668,7 @@ class SonyRemote(
                     if (options != null) info.wbOptions = options
                 }
                 PROP_BATTERY -> info.battery = current.toInt()
+                PROP_OBJECT_IN_MEMORY -> info.objectInMemory = current.toInt() and 0xFFFF
                 PROP_RECORDING_STATE -> {
                     info.recording = current == 1L
                     info.recordingKnown = true
@@ -579,12 +736,15 @@ class SonyRemote(
         dataLen = 0
         var emptyReads = 0
         var response = -1
+        val toSink = sink
+        // Ảnh chụp đầy đủ lớn hơn nhiều so với khung hình xem nên cho máy ảnh thêm thời gian
+        val timeout = if (toSink != null) 8000 else 3000
         while (response < 0) {
-            var n = c.bulkTransfer(epI, rx, readChunk, 3000)
+            var n = c.bulkTransfer(epI, rx, readChunk, timeout)
             if (n < 0 && readChunk > SAFE_CHUNK) {
                 // Điện thoại từ chối khối đọc lớn: lùi về cỡ an toàn và đọc lại
                 readChunk = SAFE_CHUNK
-                n = c.bulkTransfer(epI, rx, SAFE_CHUNK, 3000)
+                n = c.bulkTransfer(epI, rx, SAFE_CHUNK, timeout)
             }
             if (n < 0) throw IOException("Máy ảnh không phản hồi (lệnh 0x" + Integer.toHexString(code) + ")")
             if (n == 0) {
@@ -602,6 +762,23 @@ class SonyRemote(
             if (type != TYPE_DATA) continue
 
             val payload = total - 12
+            if (toSink != null) {
+                if (payload < 0 || payload > MAX_FILE_PAYLOAD) throw IOException("File ảnh quá lớn")
+                var done = minOf(n - 12, payload)
+                writeSink(toSink, rx, 12, done)
+                while (done < payload) {
+                    val want = minOf(payload - done, readChunk)
+                    var m = c.bulkTransfer(epI, rx, want, timeout)
+                    if (m < 0 && readChunk > SAFE_CHUNK) {
+                        readChunk = SAFE_CHUNK
+                        m = c.bulkTransfer(epI, rx, minOf(payload - done, SAFE_CHUNK), timeout)
+                    }
+                    if (m < 0) throw IOException("Đứt kết nối khi tải ảnh chụp")
+                    writeSink(toSink, rx, 0, m)
+                    done += m
+                }
+                continue
+            }
             if (payload < 0 || payload > MAX_PAYLOAD) throw IOException("Khối dữ liệu quá lớn")
             if (data.size < payload) data = ByteArray(payload + 64 * 1024)
             var got = n - 12
@@ -651,6 +828,9 @@ class SonyRemote(
         private const val PROP_SHUTTER_FULL = 0xD2C2
         private const val PROP_MOVIE_BUTTON = 0xD2C8
         private const val PROP_AF_AREA_POSITION = 0xD2DC
+        private const val PROP_LIVEVIEW_QUALITY = 0xD26A
+        private const val PROP_NEAR_FAR = 0xD2D1
+        const val PROP_OBJECT_IN_MEMORY = 0xD215
 
         private const val TYPE_COMMAND = 1
         private const val TYPE_DATA = 2
@@ -658,6 +838,7 @@ class SonyRemote(
 
         private const val OC_OPEN_SESSION = 0x1002
         private const val OC_CLOSE_SESSION = 0x1003
+        private const val OC_GET_OBJECT_INFO = 0x1008
         private const val OC_GET_OBJECT = 0x1009
         private const val OC_SONY_CONNECT = 0x9201
         private const val OC_SONY_GET_EXT_INFO = 0x9202
@@ -671,7 +852,11 @@ class SonyRemote(
         /** 0xFFFFC002: "đối tượng" ảo chứa khung hình live view */
         private const val LIVEVIEW_HANDLE = -16382
 
+        /** 0xFFFFC001: "đối tượng" ảo chứa ảnh vừa chụp */
+        private const val CAPTURE_HANDLE = -16383
+
         private const val MAX_PAYLOAD = 16 * 1024 * 1024
+        private const val MAX_FILE_PAYLOAD = 512 * 1024 * 1024
 
         fun whiteBalanceName(value: Int): String {
             return when (value) {

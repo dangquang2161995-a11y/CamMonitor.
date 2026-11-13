@@ -5,6 +5,9 @@
     <!-- Android 10+ bắt buộc có quyền CAMERA mới mở được thiết bị UVC -->
     <uses-permission android:name="android.permission.CAMERA" />
 
+    <!-- Cho máy phụ cùng mạng Wi-Fi mở trình duyệt xem hình và điều khiển -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- Thư viện UVC khai báo sẵn các quyền này, app không dùng nên gỡ ra -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:node="remove" />

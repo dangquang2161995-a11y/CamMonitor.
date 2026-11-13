@@ -52,6 +52,8 @@ import com.serenegiant.usb.Size
 import com.serenegiant.usb.UVCCamera
 import java.io.File
 import java.io.FileOutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -63,7 +65,7 @@ import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.egl.EGLDisplay
 
-class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, SensorEventListener {
+class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, WebServer.Listener, SensorEventListener {
 
     private val state = MonitorState()
     private lateinit var prefs: SharedPreferences
@@ -117,6 +119,64 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     private var decodeThread: Thread? = null
     @Volatile private var fpsReceived = 0
     @Volatile private var fpsShown = 0
+    @Volatile private var decodeMs = 0L
+    private var liveViewLow = false
+    private var recStartAt = 0L
+    private var batteryWarned = false
+
+    /** Phiên PC Remote hiện tại có lấy hình hay chỉ điều khiển (khi hình đi qua HDMI). */
+    private var remoteLiveView = true
+    @Volatile private var ptpControl = false
+
+    // ---- lưu ảnh vừa chụp về điện thoại
+    private var saveShots = true
+    private var shotsSaved = 0
+
+    // ---- chụp theo khoảng thời gian
+    private var intervalOn = false
+    private var intervalSec = 5
+    private var intervalTotal = 0
+    private var intervalDone = 0
+    private var intervalNextAt = 0L
+    private val intervalTick = object : Runnable {
+        override fun run() {
+            if (!intervalOn) return
+            val remote = sonyRemote
+            if (remote == null || !remoteReady()) {
+                stopInterval("Dừng chụp hẹn giờ: mất kết nối máy ảnh")
+                return
+            }
+            remote.capturePhoto()
+            intervalDone++
+            if (intervalTotal > 0 && intervalDone >= intervalTotal) {
+                stopInterval("Đã chụp xong " + intervalDone + " ảnh")
+                return
+            }
+            // Tính theo mốc thời gian để không bị trôi dần
+            intervalNextAt += intervalSec * 1000L
+            val wait = (intervalNextAt - SystemClock.elapsedRealtime()).coerceAtLeast(200L)
+            handler.postDelayed(this, wait)
+            refreshCamInfo()
+            for (u in labelUpdaters) u()
+        }
+    }
+
+    // ---- máy phụ xem qua Wi-Fi: 0 = tắt, 1 = chỉ xem, 2 = được điều khiển
+    @Volatile private var webMode = 0
+    @Volatile private var webServer: WebServer? = null
+    @Volatile private var webInfo = "Chưa nối máy ảnh"
+    private var webPin = ""
+
+    // ---- máy nhắc chữ
+    private lateinit var prompter: TeleprompterView
+    private var tpOn = false
+    private var tpText = ""
+    private var tpSpeed = 2
+    private var tpSize = 1
+    private var tpMirror = false
+    private var tpBackdrop = 1
+
+    private var uvcSizePref = ""
 
     /** Surface đang được dùng bởi: 0 = chưa ai, 1 = UVC, 2 = PC Remote */
     private var surfaceUse = 0
@@ -141,6 +201,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             checkSonyRemote()
             refreshDiag()
             updateFpsInfo()
+            refreshCamInfo()
             handler.postDelayed(this, 1000)
         }
     }
@@ -211,6 +272,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         overlay = OverlayView(this, state)
         root.addView(overlay, matchParent())
 
+        prompter = TeleprompterView(this)
+        prompter.visibility = View.GONE
+        root.addView(prompter, matchParent())
+        applyPrompter(false)
+
         statusText = TextView(this)
         statusText.setTextColor(Color.WHITE)
         statusText.textSize = 15f
@@ -218,7 +284,9 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         statusText.setPadding(dp(24), dp(16), dp(24), dp(16))
         statusText.setBackgroundColor(Color.argb(170, 0, 0, 0))
         statusText.text = TEXT_WAITING
-        statusText.setOnClickListener { connectFirstDevice() }
+        statusText.setOnClickListener {
+            if (sonyRemote != null) resetPtpConnection() else connectFirstDevice()
+        }
         root.addView(statusText, wrap(Gravity.CENTER))
 
         infoText = TextView(this)
@@ -381,6 +449,23 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             state.maxBright = !state.maxBright
             applyBrightness()
         }
+        // Chạm: bật/tắt máy nhắc chữ. Giữ lâu: nhập chữ, tốc độ, cỡ chữ, lật gương.
+        addButton(row, { "Nhắc chữ: " + onOff(tpOn) }, { showPrompterMenu() }) {
+            if (tpText.isBlank()) {
+                showPrompterEditor()
+            } else {
+                tpOn = !tpOn
+                applyPrompter(true)
+            }
+        }
+        // Chạm: đổi chế độ máy phụ. Giữ lâu: xem lại địa chỉ.
+        addButton(row, { "Máy phụ Wi-Fi: " + WEB_NAMES[webMode] }, { showWebAddress() }) {
+            val wasOff = webMode == 0
+            webMode = (webMode + 1) % WEB_NAMES.size
+            applyWebMode()
+            if (wasOff && webMode != 0 && webServer != null) showWebAddress()
+        }
+        addButton(row, { "Cỡ hình HDMI" }) { showUvcSizeMenu() }
         addButton(row, { "Preset" }) { showPresetMenu() }
         addButton(row, { "Khóa cảm ứng" }) { setLocked(true) }
         return row
@@ -395,7 +480,24 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             sonyRemote?.toggleRecord()
         }
         addButton(row, { "Chụp ảnh" }) { sonyRemote?.capturePhoto() }
+        // Chạm: bắt đầu hoặc dừng. Giữ lâu: đặt lại khoảng cách và số ảnh.
+        addButton(row, { intervalLabel() }, { showIntervalDialog() }) {
+            if (intervalOn) stopInterval("Đã dừng chụp hẹn giờ sau " + intervalDone + " ảnh") else showIntervalDialog()
+        }
+        addButton(row, { "Lưu ảnh về máy: " + onOff(saveShots) }) {
+            saveShots = !saveShots
+            sonyRemote?.saveImages = saveShots
+            prefs.edit().putBoolean("saveShots", saveShots).apply()
+            if (saveShots) {
+                toast("Trên máy ảnh đặt MENU > Network > PC Remote Function > Still Img. Save Dest. = PC+Camera. Ảnh chụp xong sẽ tự lưu vào album CamMonitor.")
+            }
+        }
         addButton(row, { "Lấy nét" }) { sonyRemote?.focus() }
+        // Chỉnh nét tay từng bước, máy ảnh phải ở MF hoặc DMF
+        addButton(row, { "Nét ◀◀" }) { sonyRemote?.manualFocus(-MF_BIG) }
+        addButton(row, { "Nét ◀" }) { sonyRemote?.manualFocus(-MF_SMALL) }
+        addButton(row, { "Nét ▶" }) { sonyRemote?.manualFocus(MF_SMALL) }
+        addButton(row, { "Nét ▶▶" }) { sonyRemote?.manualFocus(MF_BIG) }
         addButton(row, { "Chạm lấy nét: " + onOff(state.touchAf) }) {
             state.touchAf = !state.touchAf
             if (state.touchAf) {
@@ -411,7 +513,32 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         addButton(row, { "EV −" }) { sonyRemote?.stepValue(SonyRemote.PROP_EXPOSURE_COMP, false) }
         addButton(row, { "EV +" }) { sonyRemote?.stepValue(SonyRemote.PROP_EXPOSURE_COMP, true) }
         addButton(row, { "Cân bằng trắng" }) { showWhiteBalanceMenu() }
+        // Thử nghiệm: hạ chất lượng hình xem để máy ảnh gửi nhiều khung hình hơn
+        addButton(row, { "Hình xem: " + (if (liveViewLow) "Nhẹ" else "Đẹp") }) {
+            liveViewLow = !liveViewLow
+            sonyRemote?.setLiveViewQuality(liveViewLow)
+        }
+        addButton(row, { "Đặt lại kết nối" }) { resetPtpConnection() }
+        addButton(row, { "Chẩn đoán máy ảnh" }) { showCameraDiag() }
         return row
+    }
+
+    /** Ngắt phiên PC Remote hiện tại và kết nối lại ngay, không cần cắm lại cáp. */
+    private fun resetPtpConnection() {
+        logEvent("Đặt lại kết nối PC Remote")
+        toast("Đang kết nối lại máy ảnh…")
+        ptpAskedFor = null
+        ptpRetryAt = 0L
+        if (sonyRemote != null) {
+            stopSonyRemote()
+        } else {
+            checkSonyRemote()
+        }
+    }
+
+    private fun formatDuration(ms: Long): String {
+        val s = ms / 1000
+        return String.format("%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
 
     private fun addButton(
@@ -542,10 +669,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     /** Áp trạng thái ẩn/hiện của từng thanh; thanh máy ảnh chỉ có khi nối PC Remote. */
     private fun updateBars() {
         toolBar.visibility = if (showTools && !locked) View.VISIBLE else View.GONE
-        cameraBar.visibility = if (showCamera && ptpStreaming && !locked) View.VISIBLE else View.GONE
-        cameraToggle.visibility = if (ptpStreaming) View.VISIBLE else View.GONE
+        val ready = remoteReady()
+        cameraBar.visibility = if (showCamera && ready && !locked) View.VISIBLE else View.GONE
+        cameraToggle.visibility = if (ready) View.VISIBLE else View.GONE
         sideButtons.visibility = if (locked) View.GONE else View.VISIBLE
-        barsVisible = showTools || (showCamera && ptpStreaming)
+        barsVisible = showTools || (showCamera && ready)
         prefs.edit().putBoolean("showTools", showTools).putBoolean("showCamera", showCamera).apply()
         hideSystemBars()
     }
@@ -1058,14 +1186,19 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             initCamera()
         }
         applyLevelSensor()
+        applyWebMode()
         handler.removeCallbacks(diagTick)
         handler.post(diagTick)
     }
 
     override fun onStop() {
         super.onStop()
+        saveState()
         handler.removeCallbacks(diagTick)
         handler.removeCallbacks(unlockRunnable)
+        if (intervalOn) stopInterval(null)
+        prompter.pause()
+        stopWebServer()
         if (previewRecording) glView.queueEvent { renderer.stopRecording() }
         stopSonyRemote()
         releaseCamera()
@@ -1162,8 +1295,14 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             overlay.videoH = videoH
             overlay.invalidate()
             statusText.visibility = View.GONE
-            infoText.text = videoW.toString() + "×" + videoH.toString()
+            infoText.text = videoW.toString() + "×" + videoH.toString() + " · HDMI/UVC"
             logEvent("Chọn " + videoW + "x" + videoH)
+            // Có hình từ capture card: phiên PC Remote đang lấy hình phải nhường surface,
+            // sau vài giây nó tự nối lại ở chế độ chỉ điều khiển.
+            if (sonyRemote != null && remoteLiveView) {
+                ptpRetryAt = 0L
+                stopSonyRemote()
+            }
             attachSurfaceIfReady()
         }
 
@@ -1183,6 +1322,8 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             logEvent("onDetach")
             cameraOpened = false
             attachedSurface = null
+            // Mất hình HDMI: cho PC Remote nối lại ở chế độ có hình
+            if (sonyRemote != null && !remoteLiveView) stopSonyRemote()
             if (!ptpStreaming) {
                 infoText.text = ""
                 statusText.text = TEXT_WAITING
@@ -1211,6 +1352,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         if (list == null || list.isEmpty()) return null
         val mjpeg = list.filter { it.type == UVCCamera.UVC_VS_FRAME_MJPEG }
         val pool = if (mjpeg.isNotEmpty()) mjpeg else list
+        // Cỡ hình người dùng đã chọn lần trước
+        if (uvcSizePref.isNotEmpty()) {
+            val saved = pool.firstOrNull { (it.width.toString() + "x" + it.height) == uvcSizePref }
+            if (saved != null) return saved
+        }
         val exact = pool.firstOrNull { it.width == 1280 && it.height == 720 }
         if (exact != null) return exact
         val fits = pool.filter { it.width <= 1920 && it.height <= 1080 }
@@ -1256,7 +1402,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
 
     /** Gọi mỗi giây: thấy máy Sony ở chế độ PC Remote thì tự xin quyền và kết nối. */
     private fun checkSonyRemote() {
-        if (sonyRemote != null || cameraOpened) return
+        if (sonyRemote != null) return
         if (SystemClock.elapsedRealtime() < ptpRetryAt) return
         val usb = getSystemService(Context.USB_SERVICE) as UsbManager
         var found: UsbDevice? = null
@@ -1285,6 +1431,16 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             }
             return
         }
+        if (cameraOpened) {
+            // Hình đang lấy từ capture card HDMI: PC Remote chỉ dùng để điều khiển
+            logEvent("Sony PC Remote: nối để điều khiển, hình lấy từ HDMI")
+            remoteLiveView = false
+            val control = SonyRemote(usb, dev, this, false, cacheDir)
+            control.saveImages = saveShots
+            sonyRemote = control
+            control.start()
+            return
+        }
         val s = surface ?: return
         if (surfaceUse == 1) {
             requestFreshSurface()
@@ -1296,11 +1452,16 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         ptpH = 0
         statusText.text = "Đang kết nối Sony PC Remote…"
         logEvent("Sony PC Remote: bắt đầu kết nối")
-        val remote = SonyRemote(usb, dev, this)
+        remoteLiveView = true
+        val remote = SonyRemote(usb, dev, this, true, cacheDir)
+        remote.saveImages = saveShots
         sonyRemote = remote
         startDecoder()
         remote.start()
     }
+
+    /** Đã gửi được lệnh cho máy ảnh, dù hình đi qua PC Remote hay HDMI. */
+    private fun remoteReady(): Boolean = ptpStreaming || ptpControl
 
     private fun stopSonyRemote() {
         val remote = sonyRemote ?: return
@@ -1357,8 +1518,30 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         val shown = fpsShown
         fpsReceived = 0
         fpsShown = 0
-        infoText.text = videoW.toString() + "×" + videoH.toString() +
-            " · PC Remote · nhận " + received + " / hiện " + shown + " fps"
+        val sb = StringBuilder()
+        sb.append(videoW).append('×').append(videoH)
+            .append(" · nhận ").append(received).append(" / hiện ").append(shown).append(" fps")
+        val remote = sonyRemote
+        if (remote != null) {
+            // Số đo chi tiết: thời gian lấy và giải mã mỗi khung, cỡ file, số lần máy ảnh chưa có khung mới
+            val frames = remote.statFrames
+            val fetch = remote.statFetchMs
+            val bytes = remote.statBytes
+            val misses = remote.statMisses
+            remote.statFrames = 0
+            remote.statFetchMs = 0L
+            remote.statBytes = 0L
+            remote.statMisses = 0
+            val dec = decodeMs
+            decodeMs = 0L
+            if (frames > 0) {
+                sb.append(" · lấy ").append(fetch / frames).append("ms")
+                    .append(" · ").append(bytes / frames / 1024).append("KB")
+            }
+            if (shown > 0) sb.append(" · giải mã ").append(dec / shown).append("ms")
+            sb.append(" · chờ ").append(misses)
+        }
+        infoText.text = sb.toString()
     }
 
     override fun onRemoteLog(msg: String) {
@@ -1368,6 +1551,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     /** Chạy trên luồng của SonyRemote: chép khung hình cho luồng giải mã rồi quay lại lấy khung kế. */
     override fun onRemoteFrame(data: ByteArray, offset: Int, length: Int) {
         fpsReceived++
+        webServer?.publishFrame(data, offset, length)
         synchronized(frameLock) {
             if (slot.size < length) slot = ByteArray(length + 64 * 1024)
             System.arraycopy(data, offset, slot, 0, length)
@@ -1381,6 +1565,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     /** Chạy trên luồng giải mã: giải mã JPEG rồi vẽ vào surface của OpenGL. */
     private fun decodeAndDraw(data: ByteArray, length: Int) {
         val offset = 0
+        val t0 = SystemClock.elapsedRealtime()
         val s = ptpSurface ?: return
         ptpOptions.inMutable = true
         ptpOptions.inBitmap = ptpBitmap
@@ -1411,6 +1596,7 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             canvas.drawBitmap(frame, null, ptpDst, null)
             s.unlockCanvasAndPost(canvas)
             fpsShown++
+            decodeMs += SystemClock.elapsedRealtime() - t0
         } catch (e: Exception) {
             // surface vừa bị thay, bỏ khung hình này
         }
@@ -1435,12 +1621,79 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
     override fun onRemoteInfo(info: SonyInfo) {
         runOnUiThread {
             lastInfo = info
-            camInfoText.text = info.summary()
-            camInfoText.visibility = if (ptpStreaming) View.VISIBLE else View.GONE
+            if (info.recording) {
+                if (recStartAt == 0L) recStartAt = SystemClock.elapsedRealtime()
+            } else {
+                recStartAt = 0L
+            }
+            if (info.battery in 0..BATTERY_LOW) {
+                if (!batteryWarned) {
+                    batteryWarned = true
+                    logEvent("Pin máy ảnh yếu: " + info.battery + "%")
+                    toast("Pin máy ảnh còn " + info.battery + "%")
+                }
+            } else if (info.battery > BATTERY_LOW) {
+                batteryWarned = false
+            }
+            refreshCamInfo()
             overlay.cameraRecording = info.recording
             for (u in labelUpdaters) u()
             overlay.invalidate()
         }
+    }
+
+    /** Dòng thông số máy ảnh ở góc trên trái; gọi mỗi giây để đồng hồ REC chạy đều. */
+    private fun refreshCamInfo() {
+        val info = lastInfo
+        if (info == null || !remoteReady()) {
+            camInfoText.visibility = View.GONE
+            webInfo = "Máy chính chưa nối điều khiển máy ảnh"
+            return
+        }
+        val sb = StringBuilder(info.summary())
+        if (info.recording && recStartAt > 0L) {
+            sb.append("\n● REC ").append(formatDuration(SystemClock.elapsedRealtime() - recStartAt))
+        }
+        if (info.battery in 0..BATTERY_LOW) {
+            sb.append("\n⚠ Pin máy ảnh yếu: ").append(info.battery).append('%')
+        }
+        if (intervalOn) {
+            sb.append("\nChụp hẹn giờ: ").append(intervalDone)
+            if (intervalTotal > 0) sb.append('/').append(intervalTotal)
+            val left = ((intervalNextAt - SystemClock.elapsedRealtime()) / 1000L).coerceAtLeast(0L)
+            sb.append(" ảnh · ảnh kế sau ").append(left).append(" giây")
+        }
+        if (shotsSaved > 0) sb.append("\nĐã lưu về máy: ").append(shotsSaved).append(" ảnh")
+        val text = sb.toString()
+        camInfoText.text = text
+        camInfoText.visibility = View.VISIBLE
+        webInfo = text + (if (webMode == 2) "" else "\n(Máy chính đang để chế độ chỉ xem)")
+    }
+
+    override fun onRemoteReady(liveView: Boolean) {
+        runOnUiThread {
+            if (!liveView) {
+                ptpControl = true
+                updateBars()
+            }
+        }
+    }
+
+    /** Chạy trên luồng của SonyRemote: chuyển ảnh vừa tải về vào thư viện ở luồng phụ. */
+    override fun onRemoteImage(file: File, name: String) {
+        Thread {
+            val where = MediaSaver.publishPhoto(this, file, safeName(name))
+            runOnUiThread {
+                if (where != null) {
+                    shotsSaved++
+                    refreshCamInfo()
+                    if (!intervalOn) toast("Đã lưu " + name + " vào: " + where)
+                } else {
+                    logEvent("Không lưu được ảnh " + name)
+                    toast("Không lưu được ảnh " + name)
+                }
+            }
+        }.start()
     }
 
     override fun onRemoteStopped(error: String?) {
@@ -1448,8 +1701,11 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
             sonyRemote = null
             ptpSurface = null
             ptpStreaming = false
+            ptpControl = false
             stopDecoder()
             lastInfo = null
+            recStartAt = 0L
+            if (intervalOn) stopInterval("Dừng chụp hẹn giờ: mất kết nối máy ảnh")
             overlay.cameraRecording = false
             camInfoText.visibility = View.GONE
             updateBars()
@@ -1474,6 +1730,351 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         val names = Array(options.size) { SonyRemote.whiteBalanceName(options[it]) }
         dialog().setTitle("Cân bằng trắng").setItems(names) { _, which ->
             remote.setWhiteBalance(options[which])
+        }.show()
+    }
+
+    /** Bảng giá trị thô vài thuộc tính của máy ảnh, để đối chiếu khi cần thêm tính năng. */
+    private fun showCameraDiag() {
+        val raw = sonyRemote?.lastRaw
+        if (raw == null || raw.isEmpty()) {
+            toast("Chưa đọc được thông số từ máy ảnh")
+            return
+        }
+        val sb = StringBuilder()
+        sb.append("Chụp màn hình bảng này gửi cho người viết app, kèm số ảnh còn lại và thời gian quay còn lại đang hiện trên màn máy ảnh.\n\n")
+        for (code in raw.keys.sorted()) {
+            if (code < 0xD200 || code > 0xD2FF) continue
+            if (code in 0xD240..0xD25F || code == 0xD215 || code == 0xD218 || code == 0xD21D) {
+                val v = raw[code] ?: continue
+                sb.append(String.format("%04X = %d (0x%X)\n", code, v, v))
+            }
+        }
+        sb.append("\nTổng số thuộc tính: ").append(raw.size)
+        dialog().setTitle("Chẩn đoán máy ảnh").setMessage(sb.toString()).setPositiveButton("Đóng", null).show()
+    }
+
+    // ================================================================ chụp theo khoảng thời gian
+
+    private fun intervalLabel(): String {
+        if (!intervalOn) return "Chụp hẹn giờ"
+        val total = if (intervalTotal > 0) "/$intervalTotal" else ""
+        return "■ Dừng hẹn giờ ($intervalDone$total)"
+    }
+
+    private fun showIntervalDialog() {
+        if (intervalOn) {
+            toast("Dừng chụp hẹn giờ trước khi đổi cài đặt")
+            return
+        }
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), 0)
+        val secLabel = TextView(this)
+        secLabel.text = "Mỗi ảnh cách nhau (giây, từ 2 đến 3600)"
+        val secInput = EditText(this)
+        secInput.inputType = InputType.TYPE_CLASS_NUMBER
+        secInput.setText(intervalSec.toString())
+        val countLabel = TextView(this)
+        countLabel.text = "Số ảnh (0 = chụp đến khi bấm dừng)"
+        val countInput = EditText(this)
+        countInput.inputType = InputType.TYPE_CLASS_NUMBER
+        countInput.setText(intervalTotal.toString())
+        box.addView(secLabel)
+        box.addView(secInput)
+        box.addView(countLabel)
+        box.addView(countInput)
+        dialog().setTitle("Chụp theo khoảng thời gian").setView(box)
+            .setPositiveButton("Bắt đầu") { _, _ ->
+                val sec = secInput.text.toString().trim().toIntOrNull()
+                val count = countInput.text.toString().trim().toIntOrNull()
+                if (sec == null || sec < 2 || sec > 3600 || count == null || count < 0 || count > 100000) {
+                    toast("Số không hợp lệ. Khoảng cách từ 2 đến 3600 giây, số ảnh từ 0 trở lên.")
+                } else {
+                    intervalSec = sec
+                    intervalTotal = count
+                    prefs.edit().putInt("intervalSec", sec).putInt("intervalTotal", count).apply()
+                    startInterval()
+                }
+            }
+            .setNegativeButton("Hủy", null)
+            .show()
+    }
+
+    private fun startInterval() {
+        if (sonyRemote == null || !remoteReady()) {
+            toast("Chưa nối điều khiển máy ảnh")
+            return
+        }
+        intervalOn = true
+        intervalDone = 0
+        intervalNextAt = SystemClock.elapsedRealtime()
+        handler.removeCallbacks(intervalTick)
+        handler.post(intervalTick)
+        toast("Bắt đầu chụp hẹn giờ. Nên để máy ảnh ở MF để mỗi ảnh không phải lấy nét lại.")
+        for (u in labelUpdaters) u()
+    }
+
+    private fun stopInterval(message: String?) {
+        intervalOn = false
+        handler.removeCallbacks(intervalTick)
+        if (message != null) {
+            toast(message)
+            logEvent(message)
+        }
+        for (u in labelUpdaters) u()
+        refreshCamInfo()
+    }
+
+    // ================================================================ lệnh điều khiển dùng chung (máy phụ)
+
+    private fun runCameraAction(action: String): Boolean {
+        val remote = sonyRemote ?: return false
+        when (action) {
+            "rec" -> remote.toggleRecord()
+            "photo" -> remote.capturePhoto()
+            "focus" -> remote.focus()
+            "iso_up" -> remote.stepValue(SonyRemote.PROP_ISO, true)
+            "iso_down" -> remote.stepValue(SonyRemote.PROP_ISO, false)
+            "ss_up" -> remote.stepValue(SonyRemote.PROP_SHUTTER, true)
+            "ss_down" -> remote.stepValue(SonyRemote.PROP_SHUTTER, false)
+            "av_up" -> remote.stepValue(SonyRemote.PROP_F_NUMBER, true)
+            "av_down" -> remote.stepValue(SonyRemote.PROP_F_NUMBER, false)
+            "ev_up" -> remote.stepValue(SonyRemote.PROP_EXPOSURE_COMP, true)
+            "ev_down" -> remote.stepValue(SonyRemote.PROP_EXPOSURE_COMP, false)
+            "near3" -> remote.manualFocus(-MF_BIG)
+            "near1" -> remote.manualFocus(-MF_SMALL)
+            "far1" -> remote.manualFocus(MF_SMALL)
+            "far3" -> remote.manualFocus(MF_BIG)
+            else -> return false
+        }
+        return true
+    }
+
+    // ================================================================ máy phụ xem qua Wi-Fi
+
+    /** Chạy trên luồng mạng. */
+    override fun onWebCommand(action: String): String {
+        if (webMode != 2) return "Máy chính đang để chế độ chỉ xem"
+        if (!remoteReady()) return "Máy chính chưa nối điều khiển máy ảnh"
+        runOnUiThread {
+            if (webMode == 2) runCameraAction(action)
+        }
+        return "Đã gửi lệnh: $action"
+    }
+
+    /** Chạy trên luồng mạng. */
+    override fun onWebInfo(): String = webInfo
+
+    private fun applyWebMode() {
+        if (webMode == 0) {
+            stopWebServer()
+            return
+        }
+        if (webServer != null) return
+        val server = WebServer(WEB_PORT, webPin, this)
+        webServer = server
+        // Mở và đóng cổng mạng ở luồng phụ, Android không cho làm việc mạng trên luồng giao diện
+        Thread {
+            val ok = server.start()
+            runOnUiThread {
+                if (ok) {
+                    logEvent("Máy phụ Wi-Fi: đã bật ở cổng $WEB_PORT")
+                } else if (webServer === server) {
+                    webServer = null
+                    webMode = 0
+                    toast("Không mở được cổng $WEB_PORT cho máy phụ")
+                    for (u in labelUpdaters) u()
+                }
+            }
+        }.start()
+    }
+
+    private fun stopWebServer() {
+        val server = webServer ?: return
+        webServer = null
+        Thread { server.stop() }.start()
+    }
+
+    private fun localAddresses(): List<String> {
+        val list = ArrayList<String>()
+        try {
+            val all = NetworkInterface.getNetworkInterfaces() ?: return list
+            for (ni in all) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (addr in ni.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        val host = addr.hostAddress
+                        if (host != null) list.add(host)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // không đọc được danh sách mạng
+        }
+        return list
+    }
+
+    private fun showWebAddress() {
+        if (webMode == 0 || webServer == null) {
+            toast("Chạm nút này để bật máy phụ trước")
+            return
+        }
+        val sb = StringBuilder()
+        val addrs = localAddresses()
+        if (addrs.isEmpty()) {
+            sb.append("Điện thoại chưa vào mạng nào. Hãy nối Wi-Fi, hoặc bật phát Wi-Fi (hotspot) trên máy này rồi cho máy phụ nối vào.")
+        } else {
+            sb.append("Cho máy phụ vào cùng mạng Wi-Fi (hoặc nối vào hotspot của máy này), rồi mở trình duyệt gõ địa chỉ:\n\n")
+            for (a in addrs) sb.append("http://").append(a).append(':').append(WEB_PORT).append("/?k=").append(webPin).append('\n')
+            sb.append("\nNếu có nhiều dòng, thử lần lượt từng dòng.")
+        }
+        sb.append("\n\nChế độ hiện tại: ").append(WEB_NAMES[webMode])
+            .append(".\nMáy phụ nhận hình gốc từ máy ảnh (không có LUT, peaking). Hiện chỉ phát được hình khi nối PC Remote; ở chế độ HDMI máy phụ chỉ điều khiển.")
+            .append("\nAi có địa chỉ này và ở cùng mạng đều xem được, nên chỉ dùng trên mạng của bạn.")
+        dialog().setTitle("Máy phụ qua Wi-Fi").setMessage(sb.toString()).setPositiveButton("Đóng", null).show()
+    }
+
+    // ================================================================ cỡ hình HDMI (capture card)
+
+    private fun showUvcSizeMenu() {
+        val helper = cameraHelper
+        if (helper == null || !cameraOpened) {
+            toast("Chỉ dùng khi đang nối capture card HDMI")
+            return
+        }
+        val all = helper.supportedSizeList
+        if (all == null || all.isEmpty()) {
+            toast("Capture card không báo danh sách cỡ hình")
+            return
+        }
+        val seen = HashSet<String>()
+        val sizes = ArrayList<Size>()
+        for (sz in all.sortedByDescending { it.width * it.height }) {
+            val key = sz.type.toString() + ":" + sz.width + "x" + sz.height
+            if (seen.add(key)) sizes.add(sz)
+        }
+        val names = Array(sizes.size) {
+            val sz = sizes[it]
+            val kind = if (sz.type == UVCCamera.UVC_VS_FRAME_MJPEG) "MJPEG" else "không nén (fps thấp)"
+            sz.width.toString() + "×" + sz.height + " · " + kind
+        }
+        dialog().setTitle("Cỡ hình từ capture card").setItems(names) { _, which ->
+            applyUvcSize(sizes[which])
+        }.show()
+    }
+
+    private fun applyUvcSize(size: Size) {
+        val helper = cameraHelper ?: return
+        if (!cameraOpened) return
+        try {
+            val old = attachedSurface
+            if (old != null) helper.removeSurface(old)
+            attachedSurface = null
+            helper.stopPreview()
+            helper.setPreviewSize(size)
+            helper.startPreview()
+        } catch (e: Exception) {
+            toast("Capture card không nhận cỡ hình này")
+            logEvent("Đổi cỡ hình lỗi: " + (e.message ?: ""))
+        }
+        val now = helper.previewSize
+        if (now != null) {
+            videoW = now.width
+            videoH = now.height
+        }
+        uvcSizePref = videoW.toString() + "x" + videoH
+        prefs.edit().putString("uvcSize", uvcSizePref).apply()
+        overlay.videoW = videoW
+        overlay.videoH = videoH
+        overlay.invalidate()
+        infoText.text = videoW.toString() + "×" + videoH.toString() + " · HDMI/UVC"
+        logEvent("Đổi cỡ hình: " + videoW + "x" + videoH)
+        attachSurfaceIfReady()
+    }
+
+    // ================================================================ máy nhắc chữ
+
+    /** Áp cài đặt nhắc chữ lên giao diện; [save] = có lưu lại hay không. */
+    private fun applyPrompter(save: Boolean) {
+        prompter.speedDp = TP_SPEEDS[tpSpeed]
+        prompter.setTextSizeSp(TP_SIZES[tpSize])
+        prompter.setMirror(tpMirror)
+        prompter.setBackdrop(tpBackdrop)
+        if (tpOn && tpText.isNotBlank()) {
+            if (prompter.visibility != View.VISIBLE) {
+                prompter.setScript(tpText)
+                prompter.visibility = View.VISIBLE
+            }
+        } else {
+            tpOn = false
+            prompter.pause()
+            prompter.visibility = View.GONE
+        }
+        if (save) {
+            prefs.edit()
+                .putString("tpText", tpText)
+                .putInt("tpSpeed", tpSpeed)
+                .putInt("tpSize", tpSize)
+                .putBoolean("tpMirror", tpMirror)
+                .putInt("tpBackdrop", tpBackdrop)
+                .apply()
+        }
+    }
+
+    private fun showPrompterEditor() {
+        val input = EditText(this)
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        input.minLines = 5
+        input.maxLines = 10
+        input.gravity = Gravity.TOP or Gravity.START
+        input.hint = "Dán hoặc gõ kịch bản vào đây"
+        input.setText(tpText)
+        dialog().setTitle("Kịch bản nhắc chữ").setView(input)
+            .setPositiveButton("Dùng") { _, _ ->
+                tpText = input.text.toString().trim()
+                if (tpText.isEmpty()) {
+                    tpOn = false
+                } else {
+                    tpOn = true
+                    prompter.setScript(tpText)
+                }
+                applyPrompter(true)
+                for (u in labelUpdaters) u()
+            }
+            .setNegativeButton("Hủy", null)
+            .show()
+    }
+
+    private fun showPrompterMenu() {
+        val items = arrayOf(
+            "Nhập hoặc sửa kịch bản…",
+            "Tốc độ: " + TP_SPEED_NAMES[tpSpeed],
+            "Cỡ chữ: " + TP_SIZE_NAMES[tpSize],
+            "Lật gương: " + onOff(tpMirror),
+            "Nền: " + TP_BACKDROP_NAMES[tpBackdrop],
+            "Về đầu bài"
+        )
+        dialog().setTitle("Nhắc chữ").setItems(items) { _, which ->
+            when (which) {
+                0 -> showPrompterEditor()
+                1 -> dialog().setTitle("Tốc độ cuộn").setItems(TP_SPEED_NAMES) { _, i ->
+                    tpSpeed = i
+                    applyPrompter(true)
+                }.show()
+                2 -> dialog().setTitle("Cỡ chữ").setItems(TP_SIZE_NAMES) { _, i ->
+                    tpSize = i
+                    applyPrompter(true)
+                }.show()
+                3 -> {
+                    tpMirror = !tpMirror
+                    applyPrompter(true)
+                }
+                4 -> {
+                    tpBackdrop = (tpBackdrop + 1) % TP_BACKDROP_NAMES.size
+                    applyPrompter(true)
+                }
+                else -> prompter.rewind()
+            }
         }.show()
     }
 
@@ -1554,6 +2155,21 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         currentLut = prefs.getString("lutFile", "") ?: ""
         showTools = prefs.getBoolean("showTools", true)
         showCamera = prefs.getBoolean("showCamera", true)
+        saveShots = prefs.getBoolean("saveShots", true)
+        intervalSec = prefs.getInt("intervalSec", 5)
+        intervalTotal = prefs.getInt("intervalTotal", 0)
+        uvcSizePref = prefs.getString("uvcSize", "") ?: ""
+        tpText = prefs.getString("tpText", "") ?: ""
+        tpSpeed = prefs.getInt("tpSpeed", 2).coerceIn(0, TP_SPEEDS.size - 1)
+        tpSize = prefs.getInt("tpSize", 1).coerceIn(0, TP_SIZES.size - 1)
+        tpMirror = prefs.getBoolean("tpMirror", false)
+        tpBackdrop = prefs.getInt("tpBackdrop", 1).coerceIn(0, 2)
+        var pin = prefs.getString("webPin", "") ?: ""
+        if (pin.length != 4) {
+            pin = (1000..9999).random().toString()
+            prefs.edit().putString("webPin", pin).apply()
+        }
+        webPin = pin
     }
 
     private fun saveState() {
@@ -1567,6 +2183,16 @@ class MainActivity : Activity(), MonitorRenderer.Listener, SonyRemote.Listener, 
         private const val REQ_CAMERA = 1
         private const val REQ_LUT = 2
         private const val REQ_ONION = 3
+        private const val BATTERY_LOW = 20
+        private const val WEB_PORT = 8080
+        private const val MF_SMALL = 1
+        private const val MF_BIG = 5
+        private val WEB_NAMES = arrayOf("Tắt", "Chỉ xem", "Điều khiển")
+        private val TP_SPEED_NAMES = arrayOf("Rất chậm", "Chậm", "Vừa", "Nhanh", "Rất nhanh")
+        private val TP_SPEEDS = floatArrayOf(15f, 25f, 40f, 60f, 90f)
+        private val TP_SIZE_NAMES = arrayOf("Nhỏ", "Vừa", "Lớn", "Rất lớn")
+        private val TP_SIZES = floatArrayOf(22f, 30f, 40f, 52f)
+        private val TP_BACKDROP_NAMES = arrayOf("Trong suốt", "Mờ", "Đen")
         private const val EGL_RECORDABLE_ANDROID = 0x3142
         private const val ACTION_USB_PERMISSION = "com.dq.cammonitor.USB_PERMISSION"
         private const val TEXT_WAITING =
